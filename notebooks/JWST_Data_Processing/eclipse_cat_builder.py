@@ -146,8 +146,10 @@ def read_stage2_r_s_meta(stage2_fits_path):
     with fits.open(stage2_fits_path, memmap=False) as hdul:
         hdr = hdul[0].header
         keys = list(hdr.keys())
-        r_keys = {k: hdr[k] for k in keys if isinstance(k, str) and k[:2] == 'R_'}
-        s_keys = {k: hdr[k] for k in keys if isinstance(k, str) and k[:2] == 'S_'}
+        r_keys = {k: hdr[k] for k in keys
+                  if isinstance(k, str) and k[:2] == 'R_'}
+        s_keys = {k: hdr[k] for k in keys
+                  if isinstance(k, str) and k[:2] == 'S_'}
         crds_ver = hdr.get('CRDS_VER')
         crds_ctx = hdr.get('CRDS_CTX', hdr.get('CRDS_PMAP'))
         filt = hdr.get('FILTER', '') or ''
@@ -431,6 +433,7 @@ def save_single_eclipse_hdf5(ds, out_dir='.'):
 ###############################################################################
 # Code to combine multiple single-eclipse datasets into one dataset, for use
 # at RWDDT checkpoints.
+
 
 def _ensure_var(ds, name, vtype, visit_idx):
     """
@@ -716,7 +719,7 @@ def _collect_visit_meta(ds, i):
     if 'date_obs' in ds:
         val = ds['date_obs'].values[i]
         out['DATE-OBS'] = (np.datetime_as_string(val)
-                          if not np.isnat(val) else '')
+                           if not np.isnat(val) else '')
     return out
 
 
@@ -1015,38 +1018,6 @@ def _series1(values, time, visit_idx, units=None, decimals=None):
     if units is not None:
         da.attrs['units'] = units
     return da
-
-
-def _derive_visit_id_string(file_ids):
-    r"""
-    Parse JWST segment names to collect one or more VISIT_ID strings.
-
-    Parameters
-    ----------
-    file_ids : list of str
-        Base names like
-        ``jw09235001001_03101_00001-seg001_mirimage`` (no extension).
-
-    Returns
-    -------
-    str
-        Comma-separated, numerically sorted unique VISIT_IDs, each an
-        11-digit string (e.g., ``'09235001001,09235002001'``). Returns
-        an empty string if none are found.
-
-    Notes
-    -----
-    The parser looks for ``^jw(\d{11})_`` at the start of each base name.
-    """
-    pat = re.compile(r'^jw(\d{11})_')
-    ids = []
-    for fid in file_ids:
-        base = Path(fid).name
-        m = pat.match(base)
-        if m:
-            ids.append(m.group(1))
-    uniq = sorted(set(ids), key=int)
-    return ','.join(uniq)
 
 
 def build_lightcurve_dataset(
@@ -1359,7 +1330,12 @@ def save_lightcurve_hdf5(ds, out_dir='.'):
     return out_path
 
 
-def save_lightcurve_multi_hdf5(datasets, checkpoint, out_dir='.', hlspver=None):
+def save_lightcurve_multi_hdf5(
+    datasets,
+    checkpoint,
+    out_dir='.',
+    hlspver=None
+):
     """
     Save multiple single-visit light-curve datasets into one HDF5 file,
     one HDF5 group per visit (no NaN padding across disjoint time axes).
@@ -1415,7 +1391,8 @@ def save_lightcurve_multi_hdf5(datasets, checkpoint, out_dir='.', hlspver=None):
     for ds in datasets:
         # Validate shape
         if 'visit' not in ds.coords or 'time' not in ds.dims:
-            raise ValueError("Each dataset must have 'visit' coord and 'time'.")
+            raise ValueError("Each dataset must have 'visit' coord "
+                             "and 'time'.")
         if ds.dims.get('visit', 0) != 1:
             raise ValueError("Each dataset must be single-visit (visit=1).")
 
