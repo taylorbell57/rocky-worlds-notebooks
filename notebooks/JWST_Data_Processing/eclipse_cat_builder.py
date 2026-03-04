@@ -423,8 +423,7 @@ def save_single_eclipse_hdf5(ds, out_dir='.'):
     }
     ds.to_netcdf(
         out_path,
-        engine='h5netcdf',
-        invalid_netcdf=True,
+        engine='netcdf4',
         encoding=enc,
         mode='w',
     )
@@ -627,8 +626,7 @@ def save_multi_eclipse_hdf5(datasets, checkpoint, out_dir='.', hlspver=None):
 
     combined.to_netcdf(
         out_path,
-        engine='h5netcdf',
-        invalid_netcdf=True,
+        engine='netcdf4',
         encoding=enc,
         mode='w',
     )
@@ -939,7 +937,7 @@ def hdf5_single_to_fits(h5_path):
         If the input dataset is not a single-visit dataset.
     """
     ds = xr.load_dataset(h5_path)
-    n = ds.dims.get('visit', 0)
+    n = ds.sizes.get('visit', 0)
     if n != 1:
         raise ValueError('Input is not a single-visit dataset.')
     phdu = _primary_hdu_from_attrs(ds, visit_index=0)
@@ -970,7 +968,7 @@ def hdf5_checkpoint_to_fits(h5_path):
         If the input dataset has fewer than two visits.
     """
     ds = xr.load_dataset(h5_path)
-    n = ds.dims.get('visit', 0)
+    n = ds.sizes.get('visit', 0)
     if n < 2:
         raise ValueError('Input is not multi-visit (>=2 required).')
     phdu = _primary_hdu_from_attrs(ds, visit_index=None)
@@ -1322,8 +1320,7 @@ def save_lightcurve_hdf5(ds, out_dir='.'):
     }
     ds.to_netcdf(
         out_path,
-        engine='h5netcdf',
-        invalid_netcdf=True,
+        engine='netcdf4',
         encoding=enc,
         mode='w',
     )
@@ -1408,8 +1405,7 @@ def save_lightcurve_multi_hdf5(
 
         ds.to_netcdf(
             out_path,
-            engine='h5netcdf',
-            invalid_netcdf=True,
+            engine='netcdf4',
             encoding=enc,
             mode=mode,          # 'w' for first write, then 'a'
             group=group,
@@ -1417,3 +1413,4 @@ def save_lightcurve_multi_hdf5(
         mode = 'a'
 
     return out_path
+
