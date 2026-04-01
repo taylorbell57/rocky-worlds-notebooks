@@ -411,7 +411,7 @@ def save_single_eclipse_hdf5(ds, out_dir='.'):
     planet_fn = ''.join(planet.lower().split())
     out_name = (
         f'hlsp_rocky-worlds_jwst_{instrume.lower()}_{planet_fn}-'
-        f'obs{visit:03d}_{filt.lower()}_v{hlspver.lower()}_'
+        f'ecl{visit:03d}_{filt.lower()}_v{hlspver.lower()}_'
         f'eclipse-cat.h5'
     )
     out_path = str(Path(out_dir) / out_name)
@@ -1308,7 +1308,7 @@ def save_lightcurve_hdf5(ds, out_dir='.'):
     planet_fn = ''.join(planet.lower().split())
     out_name = (
         f'hlsp_rocky-worlds_jwst_{instrume.lower()}_{planet_fn}-'
-        f'obs{visit:03d}_{filt.lower()}_v{hlspver.lower()}_lc.h5'
+        f'ecl{visit:03d}_{filt.lower()}_v{hlspver.lower()}_lc.h5'
     )
     out_path = str(Path(out_dir) / out_name)
 
