@@ -2860,6 +2860,8 @@ def build_checkpoint_products(
     HLSPVER,
     out_dir='.',
     make_fits=True,
+    make_checkpoint_plots=False,
+    obs_ids=None,
 ):
     """
     Build and save all checkpoint HLSP products from a shared fit.
@@ -2885,6 +2887,14 @@ def build_checkpoint_products(
         Output directory. Created if needed.
     make_fits : bool, optional
         Whether to also write the FITS catalog product.
+    make_checkpoint_plots : bool, optional
+        Whether to also write checkpoint-level report figures from the
+        shared Stage-5 fit table.
+    obs_ids : sequence or None, optional
+        Explicit observation IDs for checkpoint observation-summary row
+        labels. A flat sequence is interpreted as one ID per detected
+        observation chunk; a nested sequence is interpreted as one sequence
+        of IDs per plotted row.
 
     Returns
     -------
@@ -2971,6 +2981,20 @@ def build_checkpoint_products(
         out_dir=out_dir,
         hlspver=HLSPVER,
     )
+    checkpoint_figures = None
+    if make_checkpoint_plots:
+        checkpoint_figures = make_checkpoint_figures(
+            stage5_fit,
+            stage5_samples,
+            stage5_epf=stage5_epf,
+            stage5_ecf=stage5_ecf,
+            date_obs=cat_combined['date_obs'].values
+            if 'date_obs' in cat_combined else None,
+            checkpoint=checkpoint,
+            planet=PLANET,
+            out_dir=out_dir,
+            obs_ids=obs_ids,
+        )
 
     return {
         'catalog_dataset': cat_combined,
@@ -2981,6 +3005,1437 @@ def build_checkpoint_products(
         'lightcurve_datasets': lc_tree,
         'lightcurve_visit_datasets': lc_datasets,
         'lightcurve_h5': lc_h5,
+        'checkpoint_figures': checkpoint_figures,
+    }
+
+
+def _load_fit_table(stage5_fit):
+    """
+    Load a Eureka Stage-5 fit table.
+
+    Parameters
+    ----------
+    stage5_fit : str or pandas.DataFrame
+        Path to a whitespace-delimited Eureka table, or an already-loaded
+        dataframe.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Fit table.
+    """
+    if isinstance(stage5_fit, pd.DataFrame):
+        return stage5_fit.copy()
+    return pd.read_csv(stage5_fit, comment='#', delimiter=r'\s+')
+
+
+def _first_fit_column(df, candidates):
+    """
+    Return the first available fit-table column from a candidate list.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Fit table.
+    candidates : list of str
+        Candidate column names.
+
+    Returns
+    -------
+    str
+        Matching column name.
+    """
+    for col in candidates:
+        if col in df.columns:
+            return col
+    joined = ', '.join(candidates)
+    raise KeyError(f'Could not find any of these columns: {joined}')
+
+
+def _match_time_scale(values, reference_time):
+    """
+    Put time values onto the same offset convention as a reference axis.
+
+    Parameters
+    ----------
+    values : array-like
+        Time values, either full BJD-like or BJD/MJD minus ``timeOffset``.
+    reference_time : array-like
+        Reference time axis.
+
+    Returns
+    -------
+    numpy.ndarray
+        Time values in the reference convention.
+    """
+    arr = np.asarray(values, dtype=float)
+    ref = np.asarray(reference_time, dtype=float)
+    if arr.size == 0 or ref.size == 0:
+        return arr
+
+    arr_med = np.nanmedian(np.abs(arr))
+    ref_med = np.nanmedian(np.abs(ref))
+    if arr_med > 1000000.0 and ref_med < 1000000.0:
+        return arr - timeOffset
+    if arr_med < 1000000.0 and ref_med > 1000000.0:
+        return arr + timeOffset
+    return arr
+
+
+def _checkpoint_timing_samples(
+    samples,
+    epf_params,
+    ecf_config,
+    fit_time,
+    visit=1,
+    channel=None,
+):
+    """
+    Resolve transit, period, and secondary-eclipse samples for plotting.
+
+    The fixed orbital quantities used by older plotting notebooks are read
+    from the EPF when absent from the posterior samples.
+
+    Parameters
+    ----------
+    samples : xarray.Dataset
+        Shared Stage-5 posterior samples.
+    epf_params : dict
+        Parsed Stage-5 EPF parameters.
+    ecf_config : dict
+        Parsed Stage-5 ECF values.
+    fit_time : array-like
+        Stage-5 fit-table time axis whose offset convention should be used.
+    visit : int, optional
+        Visit/channel to use for shared timing parameters.
+    channel : int or None, optional
+        Explicit zero-based channel override.
+
+    Returns
+    -------
+    timing : dict
+        Arrays for ``t0``, ``per``, and ``t_secondary`` in the fit-table time
+        convention.
+    """
+    n_samples = _infer_n_samples(samples)
+    compute_ltt = get_compute_ltt(ecf_config, default=True)
+    t0, _ = _resolve_visit_param(
+        samples,
+        epf_params,
+        't0',
+        visit,
+        n_samples,
+        channel=channel,
+    )
+    per, _ = _resolve_visit_param(
+        samples,
+        epf_params,
+        'per',
+        visit,
+        n_samples,
+        channel=channel,
+    )
+    t_secondary = _resolve_secondary_time_samples(
+        samples,
+        epf_params,
+        visit,
+        n_samples,
+        channel=channel,
+        eclipse_epoch=0,
+        compute_ltt=compute_ltt,
+    )
+    return {
+        't0': _match_time_scale(t0, fit_time),
+        'per': np.asarray(per, dtype=float),
+        't_secondary': _match_time_scale(t_secondary, fit_time),
+    }
+
+
+def _fit_components(fit_table):
+    """
+    Extract normalized flux, model, and cleaned-flux arrays from a fit table.
+
+    Parameters
+    ----------
+    fit_table : pandas.DataFrame
+        Stage-5 fit table.
+
+    Returns
+    -------
+    dict
+        Named numpy arrays and the selected model column names.
+    """
+    time = fit_table['time'].to_numpy(dtype=float)
+    flux = fit_table['lcdata'].to_numpy(dtype=float)
+    flux_err = fit_table['lcerr'].to_numpy(dtype=float)
+
+    astro_col = _first_fit_column(
+        fit_table,
+        [
+            'astrophysical model',
+            'astro model',
+            'astro_model',
+            'starry',
+            'batman',
+            'eclipse',
+            'transit',
+            'planetary model',
+        ],
+    )
+    astro_model = fit_table[astro_col].to_numpy(dtype=float)
+
+    try:
+        model_col = _first_fit_column(
+            fit_table,
+            ['model', 'full model', 'full_model'],
+        )
+        model = fit_table[model_col].to_numpy(dtype=float)
+    except KeyError:
+        model_col = None
+        model = astro_model.copy()
+
+    combined_correction = np.divide(
+        model,
+        astro_model,
+        out=np.ones_like(model, dtype=float),
+        where=np.isfinite(astro_model) & (astro_model != 0.0),
+    )
+
+    clean_flux = np.divide(
+        flux,
+        combined_correction,
+        out=np.full_like(flux, np.nan, dtype=float),
+        where=np.isfinite(combined_correction) & (combined_correction != 0.0),
+    )
+    clean_err = np.divide(
+        flux_err,
+        combined_correction,
+        out=np.full_like(flux_err, np.nan, dtype=float),
+        where=np.isfinite(combined_correction)
+        & (combined_correction != 0.0),
+    )
+    if 'residuals' in fit_table:
+        residuals = fit_table['residuals'].to_numpy(dtype=float)
+    else:
+        residuals = clean_flux - astro_model
+
+    return {
+        'time': time,
+        'flux': flux,
+        'flux_err': flux_err,
+        'clean_flux': clean_flux,
+        'clean_err': clean_err,
+        'model': model,
+        'astro_model': astro_model,
+        'residuals': residuals,
+        'model_col': model_col,
+        'astro_col': astro_col,
+    }
+
+
+def _weighted_bins_by_count(x, y, yerr, target_bins=28):
+    """
+    Bin sorted data into roughly ``target_bins`` inverse-variance bins.
+
+    Parameters
+    ----------
+    x, y, yerr : array-like
+        Sorted data and uncertainties.
+    target_bins : int, optional
+        Approximate number of output bins.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Binned ``x``, ``y``, and uncertainty arrays.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    yerr = np.asarray(yerr, dtype=float)
+    nbin = max(1, len(x) // int(target_bins))
+    n = len(x) // nbin * nbin
+    if n == 0:
+        empty = np.array([], dtype=float)
+        return empty, empty, empty
+
+    xb = x[:n].reshape(-1, nbin)
+    yb = y[:n].reshape(-1, nbin)
+    eb = yerr[:n].reshape(-1, nbin)
+    finite = np.isfinite(yb) & np.isfinite(eb) & (eb > 0.0)
+    weights = np.where(finite, 1.0 / eb**2, 0.0)
+    weight_sum = np.sum(weights, axis=1)
+
+    x_out = np.nanmean(xb, axis=1)
+    y_out = np.divide(
+        np.sum(weights * yb, axis=1),
+        weight_sum,
+        out=np.full(weight_sum.shape, np.nan, dtype=float),
+        where=weight_sum > 0.0,
+    )
+    err_out = np.divide(
+        1.0,
+        np.sqrt(weight_sum),
+        out=np.full(weight_sum.shape, np.nan, dtype=float),
+        where=weight_sum > 0.0,
+    )
+    return x_out, y_out, err_out
+
+
+def _phase_bins_by_histogram(phase, y, residuals, yerr, target_bins=28):
+    """
+    Bin phase-folded data using the original report-notebook convention.
+
+    Parameters
+    ----------
+    phase, y, residuals, yerr : array-like
+        Phase-sorted arrays.
+    target_bins : int, optional
+        Number of phase bins spanning the observed phase range.
+
+    Returns
+    -------
+    tuple
+        ``phase_bin``, ``flux_bin``, ``residual_bin``, ``err_bin``, and
+        approximate bin size in phase units.
+    """
+    phase = np.asarray(phase, dtype=float)
+    y = np.asarray(y, dtype=float)
+    residuals = np.asarray(residuals, dtype=float)
+    yerr = np.asarray(yerr, dtype=float)
+
+    finite = (
+        np.isfinite(phase)
+        & np.isfinite(y)
+        & np.isfinite(residuals)
+        & np.isfinite(yerr)
+    )
+    phase = phase[finite]
+    y = y[finite]
+    residuals = residuals[finite]
+    yerr = yerr[finite]
+    if phase.size == 0:
+        empty = np.array([], dtype=float)
+        return empty, empty, empty, empty, np.nan
+
+    counts, phase_edges = np.histogram(phase, int(target_bins))
+    bin_edges = np.append(0, np.cumsum(counts))
+    bin_width = float(np.nanmedian(np.diff(phase_edges)))
+
+    phase_bin = []
+    flux_bin = []
+    residual_bin = []
+    err_bin = []
+
+    for i in range(int(target_bins)):
+        lo = bin_edges[i]
+        hi = bin_edges[i + 1]
+        if hi <= lo:
+            continue
+
+        p_temp = phase[lo:hi]
+        y_temp = y[lo:hi]
+        r_temp = residuals[lo:hi]
+        e_temp = yerr[lo:hi]
+        good = np.isfinite(e_temp) & (e_temp > 0.0)
+        if not np.any(good):
+            continue
+
+        p_temp = p_temp[good]
+        y_temp = y_temp[good]
+        r_temp = r_temp[good]
+        e_temp = e_temp[good]
+
+        phase_bin.append(np.nanmedian(p_temp))
+        flux_bin.append(np.sum(y_temp * e_temp) / np.sum(e_temp))
+        residual_bin.append(np.sum(r_temp * e_temp) / np.sum(e_temp))
+        err_bin.append(
+            np.sum(e_temp * e_temp) / np.sum(e_temp) / np.sqrt(len(e_temp))
+        )
+
+    return (
+        np.asarray(phase_bin),
+        np.asarray(flux_bin),
+        np.asarray(residual_bin),
+        np.asarray(err_bin),
+        bin_width,
+    )
+
+
+def _split_indices_by_gaps(time, min_gap_days):
+    """
+    Split a time series into sorted index groups at large gaps.
+
+    Parameters
+    ----------
+    time : array-like
+        Time axis.
+    min_gap_days : float
+        Minimum gap size that starts a new group.
+
+    Returns
+    -------
+    list of numpy.ndarray
+        Sorted integer-index groups.
+    """
+    time = np.asarray(time, dtype=float)
+    if time.size == 0:
+        return []
+    order = np.argsort(time)
+    gaps = np.diff(time[order])
+    cuts = np.where(gaps > float(min_gap_days))[0] + 1
+    starts = np.r_[0, cuts]
+    stops = np.r_[cuts, len(order)]
+    return [order[start:stop] for start, stop in zip(starts, stops)]
+
+
+def _nearest_mid_eclipse_times(segments, time, t_secondary, period):
+    """
+    Find the predicted mid-eclipse closest to each observed segment.
+
+    Parameters
+    ----------
+    segments : list of numpy.ndarray
+        Observation index groups.
+    time : array-like
+        Fit-table time axis.
+    t_secondary : array-like
+        Secondary-eclipse timing samples.
+    period : array-like
+        Orbital-period samples.
+
+    Returns
+    -------
+    numpy.ndarray
+        Mid-eclipse times, one per segment.
+    """
+    tsec_ref = float(np.nanmedian(np.asarray(t_secondary, dtype=float)))
+    period_ref = float(np.nanmedian(np.asarray(period, dtype=float)))
+    mid_times = []
+    for seg in segments:
+        visit_center = float(np.nanmedian(time[np.asarray(seg)]))
+        epoch = np.rint((visit_center - tsec_ref) / period_ref)
+        mid_times.append(tsec_ref + epoch * period_ref)
+    return np.asarray(mid_times, dtype=float)
+
+
+def _observed_offsets_xlim(segments, time, mid_times, padding_fraction=0.02):
+    """
+    Return a common observed x-limit in hours from mid-eclipse.
+
+    Parameters
+    ----------
+    segments : list of numpy.ndarray
+        Observation index groups.
+    time : array-like
+        Fit-table time axis.
+    mid_times : array-like
+        Mid-eclipse time for each segment.
+    padding_fraction : float, optional
+        Fractional padding around the full observed envelope.
+
+    Returns
+    -------
+    tuple
+        ``(xmin, xmax)`` in hours.
+    """
+    offsets = []
+    for seg, tmid in zip(segments, mid_times):
+        offsets.append((time[np.asarray(seg)] - tmid) * 24.0)
+    offsets = np.concatenate(offsets)
+
+    xmin = float(np.nanmin(offsets))
+    xmax = float(np.nanmax(offsets))
+    width = xmax - xmin
+
+    finite_time = np.sort(time[np.isfinite(time)])
+    cadence = np.diff(finite_time)
+    cadence = cadence[cadence > 0.0]
+    cadence_pad = float(np.nanmedian(cadence)) * 24.0 if cadence.size else 0.0
+    pad = max(cadence_pad, float(padding_fraction) * width)
+    return xmin - pad, xmax + pad
+
+
+def _padded_ylim(values, padding_fraction=0.05, fallback=(0.0, 1.0)):
+    """
+    Return finite data limits with symmetric fractional padding.
+
+    Parameters
+    ----------
+    values : array-like or list of array-like
+        Values that should be visible on the y-axis.
+    padding_fraction : float, optional
+        Fraction of the data span to add below and above the limits.
+    fallback : tuple, optional
+        Limits to use when there are no finite values.
+
+    Returns
+    -------
+    tuple
+        ``(ymin, ymax)`` padded around the finite values.
+    """
+    if isinstance(values, (list, tuple)):
+        arrays = [
+            np.asarray(value, dtype=float).ravel()
+            for value in values
+            if np.asarray(value).size > 0
+        ]
+        if not arrays:
+            return fallback
+        arr = np.concatenate(arrays)
+    else:
+        arr = np.asarray(values, dtype=float).ravel()
+
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return fallback
+
+    ymin = float(np.nanmin(finite))
+    ymax = float(np.nanmax(finite))
+    span = ymax - ymin
+    if span == 0.0:
+        scale = max(abs(ymin), 1.0)
+        span = max(scale * 1.0e-3, 1.0e-6)
+
+    pad = float(padding_fraction) * span
+    return ymin - pad, ymax + pad
+
+
+def _zero_centered_sigma_ylim(values, nsigma=3.0):
+    """
+    Return zero-centered limits from a robust sigma estimate.
+
+    Parameters
+    ----------
+    values : array-like or list of array-like
+        Values used to estimate the plotted scatter.
+    nsigma : float, optional
+        Half-width in robust standard deviations.
+
+    Returns
+    -------
+    tuple or None
+        ``(-half_width, half_width)`` with half-width rounded up to a
+        readable value, or ``None`` if finite limits cannot be inferred.
+    """
+    if isinstance(values, (list, tuple)):
+        arrays = [
+            np.asarray(value, dtype=float).ravel()
+            for value in values
+            if np.asarray(value).size > 0
+        ]
+        if not arrays:
+            return None
+        arr = np.concatenate(arrays)
+    else:
+        arr = np.asarray(values, dtype=float).ravel()
+
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return None
+
+    center = np.nanmedian(finite)
+    mad = np.nanmedian(np.abs(finite - center))
+    sigma = 1.4826 * mad
+    if not np.isfinite(sigma) or sigma == 0.0:
+        sigma = np.nanstd(finite)
+    if not np.isfinite(sigma) or sigma == 0.0:
+        sigma = np.nanmax(np.abs(finite))
+    if not np.isfinite(sigma) or sigma == 0.0:
+        return None
+
+    half_width = float(nsigma) * float(sigma)
+    scale = 10.0 ** np.floor(np.log10(half_width))
+    fraction = half_width / scale
+    for nice_fraction in [1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 8.0]:
+        if fraction <= nice_fraction:
+            half_width = nice_fraction * scale
+            break
+    else:
+        half_width = 10.0 * scale
+
+    return -half_width, half_width
+
+
+def _observation_label(first_observation, n_observations):
+    """
+    Return a compact observation label from sequential observation numbers.
+
+    Parameters
+    ----------
+    first_observation : int
+        One-based number of the first observation represented by a row.
+    n_observations : int
+        Number of observation chunks represented by the row.
+
+    Returns
+    -------
+    str
+        Label such as ``'Observation 1'``, ``'Observations 4 & 5'``, or
+        ``'Observations 4-6'``.
+    """
+    first = int(first_observation)
+    count = int(n_observations)
+    if count <= 1:
+        return f'Observation {first}'
+    last = first + count - 1
+    if count == 2:
+        return f'Observations {first} & {last}'
+    return f'Observations {first}-{last}'
+
+
+def _observation_label_from_ids(observation_ids):
+    """
+    Return a compact observation label from explicit observation IDs.
+
+    Parameters
+    ----------
+    observation_ids : sequence
+        Observation identifiers represented by one plotted row.
+
+    Returns
+    -------
+    str
+        Label such as ``'Observation 12'`` or ``'Observations 12 & 14'``.
+    """
+    labels = [str(obs_id) for obs_id in observation_ids]
+    if len(labels) == 0:
+        return 'Observation'
+    if len(labels) == 1:
+        return f'Observation {labels[0]}'
+    if len(labels) == 2:
+        return f'Observations {labels[0]} & {labels[1]}'
+    return f"Observations {', '.join(labels[:-1])} & {labels[-1]}"
+
+
+def _apply_observation_id_override(segment_rows, obs_ids):
+    """
+    Apply explicit observation IDs to checkpoint observation-row labels.
+
+    Parameters
+    ----------
+    segment_rows : list of dict
+        Row metadata dictionaries, each with ``n_observations`` and
+        ``label`` keys.
+    obs_ids : sequence or None
+        If flat, one ID per detected observation chunk. If nested, one
+        sequence of IDs per plotted row.
+
+    Returns
+    -------
+    None
+        ``segment_rows`` is modified in place.
+    """
+    if obs_ids is None:
+        return
+
+    rows = list(obs_ids)
+    if len(rows) == len(segment_rows) and any(
+        isinstance(row, (list, tuple, np.ndarray)) for row in rows
+    ):
+        for segment_row, row_ids in zip(segment_rows, rows):
+            ids = list(row_ids)
+            expected = segment_row['n_observations']
+            if len(ids) != expected:
+                raise ValueError(
+                    'Nested obs_ids entries must match the detected '
+                    f'observation chunks per row; expected {expected}, got '
+                    f'{len(ids)}.'
+                )
+            segment_row['label'] = _observation_label_from_ids(ids)
+        return
+
+    total_observations = sum(row['n_observations'] for row in segment_rows)
+    if len(rows) != total_observations:
+        raise ValueError(
+            'obs_ids must provide one ID per detected observation chunk '
+            f'({total_observations} total), or nested IDs for each plotted '
+            f'row ({len(segment_rows)} rows).'
+        )
+
+    start = 0
+    for segment_row in segment_rows:
+        stop = start + segment_row['n_observations']
+        segment_row['label'] = _observation_label_from_ids(rows[start:stop])
+        start = stop
+
+
+def _date_obs_label(date_obs, index):
+    """
+    Return a compact label from a ``date_obs`` array.
+
+    Parameters
+    ----------
+    date_obs : array-like
+        Per-observation datetime values, typically from a catalog or
+        light-curve dataset's ``date_obs`` variable.
+    index : int
+        Observation index to label.
+
+    Returns
+    -------
+    str
+        Formatted date label.
+    """
+    if date_obs is None:
+        raise ValueError('date_obs is required for checkpoint row labels.')
+
+    values = np.asarray(date_obs)
+    if values.ndim == 0:
+        if index != 0:
+            raise IndexError('date_obs has one value but multiple rows need '
+                             'labels.')
+        value = values.item()
+    elif index >= values.size:
+        raise IndexError('date_obs has fewer values than observation rows.')
+    else:
+        value = values.ravel()[index]
+
+    try:
+        timestamp = pd.to_datetime(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'Could not parse date_obs value {value!r}.') from exc
+    if pd.isna(timestamp):
+        raise ValueError('date_obs contains NaT for an observation row.')
+    return timestamp.strftime('%b %d, %Y')
+
+
+def _checkpoint_style_axis(
+    ax,
+    x,
+    ylim,
+    xlim=None,
+    max_major_ticks=6,
+    y_major=None,
+    y_minor=None,
+    yfmt='%.3f',
+    xfmt='%.1f',
+    ticklen=4,
+):
+    """
+    Apply report-style ticks and mirrored axes to a checkpoint subplot.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axis to style.
+    x : array-like
+        X data used to infer limits when ``xlim`` is not supplied.
+    ylim : tuple
+        Y-axis limits.
+    xlim : tuple or None, optional
+        X-axis limits.
+    max_major_ticks : int, optional
+        Approximate number of major ticks.
+    y_major, y_minor : float or None, optional
+        Explicit y-axis major/minor tick spacing.
+    yfmt, xfmt : str, optional
+        Tick-label format strings.
+    ticklen : float, optional
+        Minor tick length in points.
+    """
+    from matplotlib.ticker import (
+        AutoMinorLocator,
+        FormatStrFormatter,
+        MaxNLocator,
+        MultipleLocator,
+    )
+
+    x = np.asarray(x, dtype=float)
+    if xlim is None:
+        dx = np.nanmedian(np.diff(np.sort(x)))
+        ax.set_xlim(np.nanmin(x) - dx, np.nanmax(x) + dx)
+    else:
+        ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+
+    locator = MaxNLocator(
+        nbins=max_major_ticks,
+        steps=[1, 2, 2.5, 5, 10],
+        min_n_ticks=3,
+    )
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_minor_locator(AutoMinorLocator(4))
+    ax.xaxis.set_major_formatter(FormatStrFormatter(xfmt))
+
+    if y_major is None:
+        ax.yaxis.set_major_locator(
+            MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10], min_n_ticks=3)
+        )
+    else:
+        ax.yaxis.set_major_locator(MultipleLocator(y_major))
+    if y_minor is None:
+        ax.yaxis.set_minor_locator(AutoMinorLocator(5))
+    else:
+        ax.yaxis.set_minor_locator(MultipleLocator(y_minor))
+    ax.yaxis.set_major_formatter(FormatStrFormatter(yfmt))
+
+    ax.tick_params(
+        axis='both',
+        which='major',
+        direction='inout',
+        length=2 * ticklen,
+    )
+    ax.tick_params(
+        axis='both',
+        which='minor',
+        direction='inout',
+        length=ticklen,
+    )
+
+    ax_top = ax.twiny()
+    ax_right = ax.twinx()
+    ax_top.set_xlim(ax.get_xlim())
+    ax_right.set_ylim(ax.get_ylim())
+    ax_top.xaxis.set_major_locator(
+        MaxNLocator(
+            nbins=max_major_ticks,
+            steps=[1, 2, 2.5, 5, 10],
+            min_n_ticks=3,
+        )
+    )
+    ax_top.xaxis.set_minor_locator(AutoMinorLocator(4))
+    ax_top.set_xticklabels([])
+
+    if y_major is None:
+        ax_right.yaxis.set_major_locator(
+            MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10], min_n_ticks=3)
+        )
+    else:
+        ax_right.yaxis.set_major_locator(MultipleLocator(y_major))
+    if y_minor is None:
+        ax_right.yaxis.set_minor_locator(AutoMinorLocator(5))
+    else:
+        ax_right.yaxis.set_minor_locator(MultipleLocator(y_minor))
+    ax_right.set_yticklabels([])
+
+    ax_top.tick_params(axis='x', which='both', direction='in')
+    ax_right.tick_params(axis='y', which='both', direction='in')
+
+
+def _checkpoint_plot_rc():
+    """
+    Return matplotlib rcParams for checkpoint report figures.
+
+    Returns
+    -------
+    dict
+        rcParams suitable for use with ``matplotlib.pyplot.rc_context``.
+    """
+    family = 'sans-serif'
+    fontfamily = 'DejaVu Sans'
+    fontsize = 14
+    ticklen = 5
+    return {
+        'font.family': [family],
+        f'font.{family}': fontfamily,
+        'font.cursive': [fontfamily],
+        'font.size': fontsize,
+        'axes.titlesize': fontsize,
+        'xtick.labelsize': fontsize,
+        'ytick.labelsize': fontsize,
+        'axes.labelsize': fontsize,
+        'legend.fontsize': fontsize,
+        'xtick.major.size': ticklen,
+        'ytick.major.size': ticklen,
+        'xtick.minor.size': ticklen / 2,
+        'ytick.minor.size': ticklen / 2,
+        'figure.constrained_layout.use': True,
+    }
+
+
+def make_checkpoint_phase_folded_figure(
+    stage5_fit,
+    stage5_samples,
+    stage5_epf=None,
+    stage5_ecf=None,
+    out_path=None,
+    pdf_path=None,
+    visit=1,
+    channel=None,
+    target_bins=28,
+    ylim=None,
+    zoom_ylim=None,
+    zoom_ylim_residuals=None,
+    unbinned_alpha=0.1,
+):
+    """
+    Make the four-panel phase-folded checkpoint summary figure.
+
+    Parameters
+    ----------
+    stage5_fit : str or pandas.DataFrame
+        Shared Stage-5 fit table.
+    stage5_samples : str or xarray.Dataset
+        Shared Stage-5 posterior samples.
+    stage5_epf, stage5_ecf : str or None, optional
+        Eureka parameter/control files used to resolve fixed orbital
+        quantities and ``compute_ltt``.
+    out_path, pdf_path : str or None, optional
+        Optional output paths for PNG/PDF (or any matplotlib-supported
+        formats).
+    visit : int, optional
+        Visit/channel used to resolve shared timing parameters.
+    channel : int or None, optional
+        Explicit zero-based channel override.
+    target_bins : int, optional
+        Approximate number of phase bins.
+    ylim : tuple or None, optional
+        Y limits in ppm for the full-flux and full-residual panels. If
+        ``None``, use zero-centered limits with a rounded 3-sigma half-width
+        estimated from the unbinned points.
+    zoom_ylim : tuple or None, optional
+        Y limits in ppm for the binned-flux panel. If ``None``, use
+        Matplotlib's automatic limits.
+    zoom_ylim_residuals : tuple or None, optional
+        Y limits in ppm for the binned-residual panel. If ``None``, use the
+        binned-flux panel's max-min span, centered on zero.
+    unbinned_alpha : float, optional
+        Alpha for unbinned points.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Generated figure.
+    """
+    import matplotlib.pyplot as plt
+
+    fit = _load_fit_table(stage5_fit)
+    samples = _load_samples_dataset(stage5_samples)
+    epf_params = parse_epf(stage5_epf)
+    ecf_config = parse_ecf(stage5_ecf)
+    comp = _fit_components(fit)
+    timing = _checkpoint_timing_samples(
+        samples,
+        epf_params,
+        ecf_config,
+        comp['time'],
+        visit=visit,
+        channel=channel,
+    )
+
+    t0 = float(np.nanmedian(timing['t0']))
+    period = float(np.nanmedian(timing['per']))
+    phase = ((comp['time'] - t0) / period) % 1.0
+    phase_eclipse = np.nanmedian(
+        (timing['t_secondary'] - timing['t0']) / timing['per']
+    )
+    phase_eclipse = float(phase_eclipse % 1.0)
+
+    order = np.argsort(phase)
+    order = order[np.isfinite(phase[order])]
+    phase = phase[order]
+    clean = comp['clean_flux'][order]
+    clean_err = comp['clean_err'][order]
+    residuals = comp['residuals'][order]
+    model = comp['astro_model'][order]
+    clean_ppm = (clean - 1.0) * 1.0e6
+    residuals_ppm = residuals * 1.0e6
+
+    if ylim is None:
+        ylim = _zero_centered_sigma_ylim([clean_ppm, residuals_ppm])
+
+    pb, yb, residualsb, yerrb, phase_bin_width = _phase_bins_by_histogram(
+        phase,
+        clean,
+        residuals,
+        clean_err,
+        target_bins=target_bins,
+    )
+    bin_size_minutes = int(np.round(phase_bin_width * period * 24.0 * 60.0))
+
+    with plt.rc_context(_checkpoint_plot_rc()):
+        fig, axs = plt.subplots(
+            nrows=4,
+            ncols=1,
+            figsize=(12 * 0.8, 12 * 0.8),
+            sharex=True,
+            gridspec_kw={
+                'hspace': 0,
+                'height_ratios': [1.0, 0.85, 1.0, 0.85],
+            },
+        )
+
+        axs[0].errorbar(
+            phase,
+            clean_ppm,
+            yerr=clean_err * 1.0e6,
+            fmt='.',
+            color='grey',
+            alpha=unbinned_alpha,
+            label='Unbinned Data',
+        )
+        axs[0].errorbar(
+            pb,
+            (yb - 1.0) * 1.0e6,
+            yerr=yerrb * 1.0e6,
+            fmt='.',
+            color='k',
+            alpha=1,
+            label=f'Binned Data ({bin_size_minutes} mins)',
+        )
+        axs[0].plot(
+            phase,
+            (model - 1.0) * 1.0e6,
+            '-',
+            c='r',
+            zorder=np.inf,
+            label='Eclipse Model',
+        )
+        axs[0].axvline(
+            phase_eclipse,
+            ls='dotted',
+            c='red',
+            label='Mid-Eclipse Timing',
+        )
+        if ylim is not None:
+            axs[0].set_ylim(*ylim)
+
+        axs[1].errorbar(
+            pb,
+            (yb - 1.0) * 1.0e6,
+            yerr=yerrb * 1.0e6,
+            fmt='.',
+            color='k',
+            alpha=1,
+        )
+        axs[1].plot(phase, (model - 1.0) * 1.0e6, '-', c='r',
+                    zorder=np.inf)
+        axs[1].axvline(phase_eclipse, ls='dotted', c='red')
+        if zoom_ylim is not None:
+            axs[1].set_ylim(*zoom_ylim)
+        binned_flux_ylim = axs[1].get_ylim()
+
+        axs[2].errorbar(
+            phase,
+            residuals_ppm,
+            yerr=clean_err * 1.0e6,
+            fmt='.',
+            color='grey',
+            alpha=unbinned_alpha,
+        )
+        axs[2].errorbar(
+            pb,
+            residualsb * 1.0e6,
+            yerr=yerrb * 1.0e6,
+            fmt='.',
+            color='k',
+            alpha=1,
+        )
+        axs[2].plot(phase, np.zeros_like(phase), '-', c='r', zorder=np.inf)
+        axs[2].axvline(phase_eclipse, ls='dotted', c='red')
+        if ylim is not None:
+            axs[2].set_ylim(*ylim)
+
+        axs[3].errorbar(
+            pb,
+            residualsb * 1.0e6,
+            yerr=yerrb * 1.0e6,
+            fmt='.',
+            color='k',
+            alpha=1,
+        )
+        axs[3].plot(phase, np.zeros_like(phase), '-', c='r', zorder=np.inf)
+        axs[3].axvline(phase_eclipse, ls='dotted', c='red')
+        if zoom_ylim_residuals is None:
+            zoom_span = binned_flux_ylim[1] - binned_flux_ylim[0]
+            zoom_ylim_residuals = (-0.5 * zoom_span, 0.5 * zoom_span)
+        axs[3].set_ylim(*zoom_ylim_residuals)
+
+        if phase.size > 2:
+            phase_pad = phase[2] - phase[0]
+        else:
+            phase_pad = 0.01
+        axs[0].set_xlim(phase[0] - phase_pad, phase[-1] + phase_pad)
+
+        axs[0].set_ylabel('Planetary Flux\n(ppm)')
+        axs[1].set_ylabel('Binned Flux\n(ppm)')
+        axs[2].set_ylabel('Residuals\n(ppm)')
+        axs[3].set_ylabel('Binned Residuals\n(ppm)')
+        axs[3].set_xlabel('Orbital Phase')
+        fig.align_ylabels(axs)
+
+        handles, labels = axs[0].get_legend_handles_labels()
+        handles = handles[2:] + handles[:2]
+        labels = labels[2:] + labels[:2]
+        axs[0].legend(handles, labels, loc=8, bbox_to_anchor=(0.5, 1),
+                      ncol=2)
+
+        for ax in axs:
+            ax.minorticks_on()
+
+        for ax in axs[:-1]:
+            ax.tick_params(
+                axis='x',
+                which='both',
+                direction='in',
+                bottom=True,
+                top=True,
+            )
+            ax.tick_params(axis='y', which='major', direction='inout',
+                           left=True)
+            ax.tick_params(axis='y', which='minor', direction='inout',
+                           left=True)
+        axs[-1].tick_params(axis='x', which='major', direction='inout',
+                            bottom=True)
+        axs[-1].tick_params(axis='x', which='minor', direction='inout',
+                            bottom=True)
+        axs[-1].tick_params(axis='y', which='major', direction='inout',
+                            left=True)
+        axs[-1].tick_params(axis='y', which='minor', direction='inout',
+                            left=True)
+
+        for ax in axs:
+            ax_right = ax.twinx()
+            ax_right.set_ylim(ax.get_ylim())
+            ax_right.set_yticklabels([])
+            ax_right.minorticks_on()
+            ax_right.tick_params(axis='y', which='both', direction='in')
+        ax_top = axs[-1].twiny()
+        ax_top.set_xlim(axs[-1].get_xlim())
+        ax_top.set_xticklabels([])
+        ax_top.minorticks_on()
+        ax_top.tick_params(axis='x', which='both', direction='in')
+
+        if out_path is not None:
+            fig.savefig(out_path, dpi=300, bbox_inches='tight')
+        if pdf_path is not None:
+            fig.savefig(pdf_path, dpi=300, bbox_inches='tight')
+        return fig
+
+
+def make_checkpoint_observation_summary_figure(
+    stage5_fit,
+    stage5_samples,
+    stage5_epf=None,
+    stage5_ecf=None,
+    out_path=None,
+    pdf_path=None,
+    visit=1,
+    channel=None,
+    target_bins=28,
+    internal_gap_days=0.003,
+    visit_gap_days=0.5,
+    raw_ylim=None,
+    clean_ylim=None,
+    date_obs=None,
+    obs_ids=None,
+):
+    """
+    Make the per-observation checkpoint report summary figure.
+
+    Parameters
+    ----------
+    stage5_fit : str or pandas.DataFrame
+        Shared Stage-5 fit table.
+    stage5_samples : str or xarray.Dataset
+        Shared Stage-5 posterior samples.
+    stage5_epf, stage5_ecf : str or None, optional
+        Eureka parameter/control files used to resolve fixed orbital
+        quantities and ``compute_ltt``.
+    out_path, pdf_path : str or None, optional
+        Optional output paths for PNG/PDF.
+    visit : int, optional
+        Visit/channel used to resolve shared timing parameters.
+    channel : int or None, optional
+        Explicit zero-based channel override.
+    target_bins : int, optional
+        Approximate number of binned points per continuous chunk.
+    internal_gap_days : float, optional
+        Gap threshold used to avoid drawing model lines across short breaks.
+    visit_gap_days : float, optional
+        Gap threshold used to split distinct observations.
+    raw_ylim : tuple or None, optional
+        Y-axis limits for raw flux panels. If ``None``, limits are computed
+        from all plotted raw-flux points in the left column.
+    clean_ylim : tuple or None, optional
+        Y-axis limits for calibrated flux panels. If ``None``, limits are
+        computed from the binned calibrated-flux points and their
+        uncertainties only.
+    date_obs : array-like
+        Per-observation datetimes used for row labels.
+    obs_ids : sequence or None, optional
+        Explicit observation IDs for row labels. A flat sequence is
+        interpreted as one ID per detected observation chunk. A nested
+        sequence is interpreted as one sequence of IDs per plotted row.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Generated figure.
+    """
+    import matplotlib.pyplot as plt
+
+    fit = _load_fit_table(stage5_fit)
+    samples = _load_samples_dataset(stage5_samples)
+    epf_params = parse_epf(stage5_epf)
+    ecf_config = parse_ecf(stage5_ecf)
+    comp = _fit_components(fit)
+    timing = _checkpoint_timing_samples(
+        samples,
+        epf_params,
+        ecf_config,
+        comp['time'],
+        visit=visit,
+        channel=channel,
+    )
+
+    time = comp['time']
+    segments = _split_indices_by_gaps(time, min_gap_days=visit_gap_days)
+    mid_times = _nearest_mid_eclipse_times(
+        segments,
+        time,
+        timing['t_secondary'],
+        timing['per'],
+    )
+    common_xlim = _observed_offsets_xlim(segments, time, mid_times)
+
+    segment_rows = []
+    next_observation = 1
+    for i, seg in enumerate(segments):
+        seg = np.asarray(seg)
+        seg = seg[np.argsort(time[seg])]
+        chunks = _split_indices_by_gaps(
+            time[seg],
+            min_gap_days=internal_gap_days,
+        )
+        n_observations = max(1, len(chunks))
+        colors = [
+            f'C{(next_observation + j - 1) % 10}'
+            for j in range(n_observations)
+        ]
+        segment_rows.append(
+            {
+                'seg': seg,
+                'chunks': chunks,
+                'label': _observation_label(
+                    next_observation,
+                    n_observations,
+                ),
+                'n_observations': n_observations,
+                'colors': colors,
+                'mid_time': mid_times[i],
+            }
+        )
+        next_observation += n_observations
+    _apply_observation_id_override(segment_rows, obs_ids)
+
+    if raw_ylim is None:
+        raw_ylim = _padded_ylim(
+            [comp['flux'][row['seg']] for row in segment_rows],
+            padding_fraction=0.04,
+        )
+
+    if clean_ylim is None:
+        binned_clean = []
+        for row in segment_rows:
+            seg = row['seg']
+            tmid = row['mid_time']
+            for chunk in row['chunks']:
+                ii = seg[chunk]
+                xx = (time[ii] - tmid) * 24.0
+                _, yb, eb = _weighted_bins_by_count(
+                    xx,
+                    comp['clean_flux'][ii],
+                    comp['clean_err'][ii],
+                    target_bins=target_bins,
+                )
+                binned_clean.append(yb)
+                binned_clean.append(yb - eb)
+                binned_clean.append(yb + eb)
+        clean_ylim = _padded_ylim(binned_clean, padding_fraction=0.08)
+
+    with plt.rc_context(_checkpoint_plot_rc()):
+        nrows = len(segments)
+        fig, axs = plt.subplots(
+            nrows=nrows,
+            ncols=2,
+            figsize=(11.2, 2.25 * nrows),
+            gridspec_kw={'hspace': 0.0, 'wspace': 0.06},
+            squeeze=False,
+        )
+
+        for i, row in enumerate(segment_rows):
+            seg = row['seg']
+            tmid = row['mid_time']
+            x = (time[seg] - tmid) * 24.0
+
+            label = row['label'] + '\n' + _date_obs_label(date_obs, i)
+
+            for chunk, color in zip(row['chunks'], row['colors']):
+                ii = seg[chunk]
+                xx = (time[ii] - tmid) * 24.0
+                axs[i, 0].plot(
+                    xx,
+                    comp['flux'][ii],
+                    '.',
+                    color=color,
+                    alpha=0.8,
+                    ms=2,
+                    rasterized=True,
+                )
+                axs[i, 0].plot(
+                    xx,
+                    comp['model'][ii],
+                    '-',
+                    c='k',
+                    lw=1.4,
+                    zorder=10,
+                )
+
+                axs[i, 1].plot(
+                    xx,
+                    comp['clean_flux'][ii],
+                    '.',
+                    color=color,
+                    alpha=0.06,
+                    ms=2,
+                    rasterized=True,
+                )
+                xb, yb, eb = _weighted_bins_by_count(
+                    xx,
+                    comp['clean_flux'][ii],
+                    comp['clean_err'][ii],
+                    target_bins=target_bins,
+                )
+                axs[i, 1].errorbar(
+                    xb,
+                    yb,
+                    yerr=eb,
+                    fmt='.',
+                    color=color,
+                    ms=8,
+                    zorder=5,
+                )
+                axs[i, 1].plot(
+                    xx,
+                    comp['astro_model'][ii],
+                    '-',
+                    c='k',
+                    lw=1.4,
+                    zorder=10,
+                )
+
+            for ax in axs[i]:
+                ax.axvline(0.0, ls='dotted', c='0.25', lw=1.2, zorder=20)
+
+            axs[i, 0].set_ylabel(label)
+            _checkpoint_style_axis(
+                axs[i, 0],
+                x,
+                ylim=raw_ylim,
+                xlim=common_xlim,
+                y_major=0.002,
+                y_minor=0.0005,
+                yfmt='%.3f',
+            )
+            _checkpoint_style_axis(
+                axs[i, 1],
+                x,
+                ylim=clean_ylim,
+                xlim=common_xlim,
+                y_major=0.0002,
+                y_minor=0.00005,
+                yfmt='%.4f',
+            )
+
+        axs[0, 0].set_title('Normalized Raw Flux')
+        axs[0, 1].set_title('Normalized Calibrated Flux')
+        axs[-1, 0].set_xlabel('Time from mid-eclipse (hours)')
+        axs[-1, 1].set_xlabel('Time from mid-eclipse (hours)')
+
+        if out_path is not None:
+            fig.savefig(out_path, dpi=300, bbox_inches='tight')
+        if pdf_path is not None:
+            fig.savefig(pdf_path, dpi=300, bbox_inches='tight')
+        return fig
+
+
+def make_checkpoint_figures(
+    stage5_fit,
+    stage5_samples,
+    stage5_epf=None,
+    stage5_ecf=None,
+    checkpoint=None,
+    planet=None,
+    out_dir='.',
+    prefix=None,
+    date_obs=None,
+    obs_ids=None,
+):
+    """
+    Make and save the standard checkpoint report figures.
+
+    Parameters
+    ----------
+    stage5_fit : str or pandas.DataFrame
+        Shared Stage-5 fit table.
+    stage5_samples : str or xarray.Dataset
+        Shared Stage-5 posterior samples.
+    stage5_epf, stage5_ecf : str or None, optional
+        Eureka parameter/control files used to resolve fixed orbital
+        quantities and ``compute_ltt``.
+    checkpoint : int or None, optional
+        Checkpoint number used in default filenames.
+    planet : str or None, optional
+        Planet name used in default filenames.
+    out_dir : str, optional
+        Output directory.
+    prefix : str or None, optional
+        Filename prefix. If ``None``, one is built from ``checkpoint`` and
+        ``planet``.
+    date_obs : array-like
+        Per-observation datetimes used for observation-summary row labels.
+    obs_ids : sequence or None, optional
+        Explicit observation IDs for observation-summary row labels. A flat
+        sequence is interpreted as one ID per detected observation chunk; a
+        nested sequence is interpreted as one sequence of IDs per plotted row.
+
+    Returns
+    -------
+    dict
+        Paths and figure objects for the generated report figures.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if prefix is None:
+        pieces = []
+        if checkpoint is not None:
+            pieces.append(f'checkpoint{int(checkpoint):02d}')
+        if planet:
+            pieces.append(''.join(str(planet).lower().split()))
+        prefix = '_'.join(pieces) if pieces else 'checkpoint'
+
+    phase_png = str(out_dir / f'{prefix}_phase_folded_4panel.png')
+    phase_pdf = str(out_dir / f'{prefix}_phase_folded_4panel.pdf')
+    obs_png = str(out_dir / f'{prefix}_observations_summary.png')
+    obs_pdf = str(out_dir / f'{prefix}_observations_summary.pdf')
+
+    phase_fig = make_checkpoint_phase_folded_figure(
+        stage5_fit,
+        stage5_samples,
+        stage5_epf=stage5_epf,
+        stage5_ecf=stage5_ecf,
+        out_path=phase_png,
+        pdf_path=phase_pdf,
+    )
+    obs_fig = make_checkpoint_observation_summary_figure(
+        stage5_fit,
+        stage5_samples,
+        stage5_epf=stage5_epf,
+        stage5_ecf=stage5_ecf,
+        out_path=obs_png,
+        pdf_path=obs_pdf,
+        date_obs=date_obs,
+        obs_ids=obs_ids,
+    )
+    return {
+        'phase_folded': phase_png,
+        'phase_folded_pdf': phase_pdf,
+        'observation_summary': obs_png,
+        'observation_summary_pdf': obs_pdf,
+        'phase_folded_figure': phase_fig,
+        'observation_summary_figure': obs_fig,
     }
 
 
