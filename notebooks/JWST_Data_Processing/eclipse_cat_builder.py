@@ -167,6 +167,9 @@ def build_single_eclipse(
     PLANET,
     SRC_DOI,
     HLSPVER,
+    stage5_epf=None,
+    stage5_ecf=None,
+    eclipse_epoch=None,
 ):
     """
     Build a one-row (visit) Dataset with visit-varying fields as columns.
@@ -186,8 +189,9 @@ def build_single_eclipse(
         Path to Stage 4 flux calibration product holding stellar flux and
         error.
     stage5_samples : str
-        Path to Stage 5 posterior samples with ``fp`` and ``t_secondary``
-        variables.
+        Path to Stage 5 posterior samples. The samples may contain direct
+        ``fp`` and ``t_secondary`` variables, or timing parameters that can
+        be combined with fixed values from ``stage5_epf``.
     visit : int
         Eclipse index you assign (1, 2, ...) used for the ``visit`` coord
         and in output filenames. This is distinct from JWST VISIT_ID(s).
@@ -199,6 +203,16 @@ def build_single_eclipse(
         DOI for the source data specific to this visit.
     HLSPVER : str
         HLSP version string to store in the dataset attributes.
+    stage5_epf : str or None, optional
+        Eureka Stage-5 parameter file. Fixed values from this file are used
+        when posterior samples do not directly contain a needed parameter.
+    stage5_ecf : str or None, optional
+        Eureka Stage-5 control file. Its ``compute_ltt`` setting controls
+        whether derived secondary-eclipse times include the light-travel-time
+        correction. Defaults to ``True`` when absent.
+    eclipse_epoch : int or None, optional
+        Explicit eclipse epoch for derived secondary-eclipse times. If
+        ``None``, the epoch is inferred from the Stage-2 exposure midpoint.
 
     Returns
     -------
@@ -211,12 +225,15 @@ def build_single_eclipse(
     The output is designed for later concatenation along the ``visit``
     dimension using :func:`xarray.concat`. The ``VISIT_ID`` column is
     derived from Stage-3 segment names and may contain multiple IDs
-    (comma-separated) if the eclipse spans several JWST observations.
+    (comma-separated) if the eclipse spans several JWST observations. When
+    ``t_secondary`` is absent or fixed indirectly, the function derives the
+    mid-eclipse time from ``t0``, ``per``, eccentricity parameters, and the
+    EPF/ECF context.
     """
     # Load inputs (the LC file path is accepted but not used nor stored)
     spec_ds = xr.load_dataset(stage3_specdata)
     fluxcal = xr.load_dataset(stage4cal)
-    samples = xr.load_dataset(stage5_samples)
+    samples = _load_samples_dataset(stage5_samples)
     dm = JwstDataModel(stage2_fits)
 
     # FITS header provenance and context
@@ -270,27 +287,43 @@ def build_single_eclipse(
         crds_ctx_hdr or getattr(dm.meta.ref_file.crds, 'context_used', '')
     )
 
+    v = int(visit)
+    epf_params = parse_epf(stage5_epf)
+    ecf_config = parse_ecf(stage5_ecf)
+    compute_ltt = get_compute_ltt(ecf_config, default=True)
+    n_samples = _infer_n_samples(samples)
+    ch = 0
+
     # Science results: eclipse depth (ppm)
-    depth_vals = samples.fp.values * 1e6
-    d_med = np.round(np.median(depth_vals), eclipseDepthDecimals)
-    d_std = np.round(np.std(depth_vals), eclipseDepthDecimals)
-    d_p = np.percentile(
-        depth_vals,
-        [lowerErrorPercentile, medianPercentile, upperErrorPercentile],
+    fp_samples, _ = _resolve_visit_param(
+        samples,
+        epf_params,
+        'fp',
+        v,
+        n_samples,
+        channel=ch,
     )
-    d_up = np.round(d_p[2] - d_p[1], eclipseDepthDecimals)
-    d_lo = np.round(d_p[1] - d_p[0], eclipseDepthDecimals)
+    depth_vals = np.asarray(fp_samples, dtype=float) * 1.0e6
+    d_med, d_std, d_up, d_lo = _array_stats(
+        depth_vals,
+        eclipseDepthDecimals,
+    )
 
     # Science results: eclipse time
-    t_vals = samples.t_secondary.values + timeOffset
-    t_med = np.round(np.median(t_vals), eclipseTimeDecimals)
-    t_std = np.round(np.std(t_vals), eclipseTimeDecimals)
-    t_p = np.percentile(
-        t_vals,
-        [lowerErrorPercentile, medianPercentile, upperErrorPercentile],
+    t_vals = _resolve_secondary_time_samples(
+        samples,
+        epf_params,
+        v,
+        n_samples,
+        mjd_mid=mjd_mid,
+        channel=ch,
+        eclipse_epoch=eclipse_epoch,
+        compute_ltt=compute_ltt,
     )
-    t_up = np.round(t_p[2] - t_p[1], eclipseTimeDecimals)
-    t_lo = np.round(t_p[1] - t_p[0], eclipseTimeDecimals)
+    t_med, t_std, t_up, t_lo = _array_stats(
+        t_vals,
+        eclipseTimeDecimals,
+    )
 
     # Science results: absolute flux (with systematic inflation)
     stellar_flux = float(fluxcal.ecl_flux.data[0][0])
@@ -301,7 +334,6 @@ def build_single_eclipse(
     f_err = np.round(stellar_flux_err, absoluteFluxDecimals)
 
     # Build Dataset (one row)
-    v = int(visit)
     ds = xr.Dataset()
 
     # Results with units (via helper to avoid duplication)
@@ -371,6 +403,7 @@ def build_single_eclipse(
             'RA_TARG': ra_targ,
             'DEC_TARG': dec_targ,
             'PROPOSID': proposid,
+            'LTT_CORR': int(bool(compute_ltt)),
         }
     )
 
@@ -646,12 +679,16 @@ def _set_card(hdr, key, value, comment=None):
     key : str
         FITS keyword to write.
     value : Any
-        Value to write. Strings are ASCII-normalized.
+        Value to write. Strings are ASCII-normalized. List-like values are
+        joined into one string because FITS header cards require scalars.
     comment : str or None, optional
         Optional comment for the card.
     """
     if value is None:
         return
+    if isinstance(value, (list, tuple, np.ndarray)):
+        separator = '; ' if key == 'NOTES' else ' '
+        value = separator.join(str(v) for v in np.asarray(value).ravel())
     if isinstance(value, str):
         value = _to_ascii(value)
     hdr[key] = (value, None if comment is None else _to_ascii(comment))
@@ -852,7 +889,7 @@ def _primary_hdu_from_attrs(ds, visit_index=None):
         'HLSPVER', 'HLSPID', 'HLSPNAME', 'HLSP_PI', 'HLSPLEAD', 'DOI',
         'STAR', 'PLANET', 'HLSPTARG', 'OBSERVAT', 'TELESCOP', 'INSTRUME',
         'RADESYS', 'TIMESYS', 'TUNIT', 'LICENSE', 'LICENURL', 'RA_TARG',
-        'DEC_TARG', 'PROPOSID', 'LTT_CORR',
+        'DEC_TARG', 'PROPOSID', 'LTT_CORR', 'NOTES',
     ]:
         _set_card(hdr, key, ds.attrs.get(key))
     # Single-visit: include per-visit metadata in PRIMARY
@@ -1081,7 +1118,10 @@ def _normalize_raw_flux_by_time_groups(
     observations. The Stage-5 fit table normalizes each observation
     separately, so the Stage-4 raw flux and error must be divided by a
     separate scale factor in each observation group rather than by one
-    scalar over the entire visit.
+    scalar over the entire visit. If Stage 5 only fitted a subset of those
+    observations, groups with no fitted integrations use the nearest
+    fitted group's scale as a fallback so they are still delivered in
+    normalized-flux units.
     """
     raw_flux = np.asarray(raw_flux, dtype=float)
     raw_err = np.asarray(raw_err, dtype=float)
@@ -1101,8 +1141,12 @@ def _normalize_raw_flux_by_time_groups(
     fit_df = pd.DataFrame({'flux': fit_flux}, index=fit_time)
     fit_df = fit_df[~fit_df.index.duplicated(keep='first')]
 
-    for group in groups:
+    scales = np.full(len(groups), np.nan, dtype=float)
+    centers = np.full(len(groups), np.nan, dtype=float)
+
+    for i, group in enumerate(groups):
         group_time = full_time[group]
+        centers[i] = np.nanmedian(group_time)
         y = fit_df.reindex(group_time)['flux'].values
         x = raw_flux[group]
 
@@ -1114,6 +1158,18 @@ def _normalize_raw_flux_by_time_groups(
             scale = np.nan
         else:
             scale = numer / denom
+
+        if np.isfinite(scale) and scale != 0.0:
+            scales[i] = scale
+
+    valid_scales = np.isfinite(scales) & (scales != 0.0)
+
+    for i, group in enumerate(groups):
+        scale = scales[i]
+        if not np.isfinite(scale) or scale == 0.0:
+            if np.any(valid_scales) and np.isfinite(centers[i]):
+                dist = np.abs(centers[valid_scales] - centers[i])
+                scale = scales[valid_scales][np.argmin(dist)]
 
         if not np.isfinite(scale) or scale == 0.0:
             raw_flux_norm[group] = raw_flux[group]
@@ -1154,6 +1210,8 @@ def _match_stage4_errors_to_fit_lcerr(
     raw_err_matched : numpy.ndarray
         Stage-4-normalized errors multiplied by the per-group median ratio
         ``lcerr / raw_err_stage4_norm`` measured on retained integrations.
+        Groups with no retained integrations use the nearest fitted group's
+        ratio as a fallback.
 
     Notes
     -----
@@ -1162,6 +1220,8 @@ def _match_stage4_errors_to_fit_lcerr(
     scaling, but only for retained integrations. This helper infers the
     corresponding multiplicative factor from retained integrations in each
     observation-like time group and applies it to dropped integrations too.
+    If Stage 5 fitted only a subset of observation groups, unfitted groups
+    use the nearest fitted group's uncertainty scale.
     """
     raw_err_stage4_norm = np.asarray(raw_err_stage4_norm, dtype=float)
     full_time = np.asarray(full_time, dtype=float)
@@ -1172,8 +1232,13 @@ def _match_stage4_errors_to_fit_lcerr(
     fit_df = pd.DataFrame({'err': fit_err}, index=fit_time)
     fit_df = fit_df[~fit_df.index.duplicated(keep='first')]
 
-    for group in _time_group_slices(full_time, gap_factor=gap_factor):
+    groups = _time_group_slices(full_time, gap_factor=gap_factor)
+    err_scales = np.full(len(groups), np.nan, dtype=float)
+    centers = np.full(len(groups), np.nan, dtype=float)
+
+    for i, group in enumerate(groups):
         group_time = full_time[group]
+        centers[i] = np.nanmedian(group_time)
         fit_err_group = fit_df.reindex(group_time)['err'].values
         stage4_err_group = raw_err_stage4_norm[group]
         finite = (
@@ -1188,6 +1253,17 @@ def _match_stage4_errors_to_fit_lcerr(
         if ratios.size == 0:
             continue
         scale = float(np.nanmedian(ratios))
+        if np.isfinite(scale) and scale > 0.0:
+            err_scales[i] = scale
+
+    valid_scales = np.isfinite(err_scales) & (err_scales > 0.0)
+
+    for i, group in enumerate(groups):
+        scale = err_scales[i]
+        if not np.isfinite(scale) or scale <= 0.0:
+            if np.any(valid_scales) and np.isfinite(centers[i]):
+                dist = np.abs(centers[valid_scales] - centers[i])
+                scale = err_scales[valid_scales][np.argmin(dist)]
         if np.isfinite(scale) and scale > 0.0:
             raw_err_matched[group] = raw_err_matched[group] * scale
 
