@@ -7,15 +7,36 @@ For the deep-dive processing, the Stage 1-5 Eureka! Parameter Files will need to
 
 All told, running Stages 1--5 for a single aperture+annulus pair will take ~30 minutes. Likely you'll want to explore many aperture+annulus pairs (the notebook is setup to automatically do this) which can result in many-hour analysis runs.
 
+Below are the steps that we recommend you follow, along with detailed description of the parameters and steps available to explore in the notebook.
+
 ## Order of operations
 
-Choose one Stage 1 setup. Run a suite of different S3 settings. Run Stage 4 on that suite. Initially run Stage 5 on just one reduction to make sure your S5 settings can produce a good fit. Once you know you can get a good fit out of S5, re-run S5 with the full suite of reductions. Compare reductions using the code near the bottom to choose which setting seems optimal.
+The following is a recommended order to structure your analysis:
 
-Then make a copy of your notebook and run Stages 1-5 with different S1 settings but only your preferred S3 aperture+annulus setting. This will help to avoid enormous computational effort of trying to do a grid over many S1 settings and many S3 settings.
+1 – Choose one Stage 1 setup.
+
+2 – Run Stage 2 on that setup.
+
+3 – Run a suite of different Stage 3 settings, particularly different aperture and annulus combinations. The default photap, skyin, skywidth should provide a sufficient sweep. This can take a while.
+
+4 – Run Stage 4 on those aperture+annulus combinations using default inputs. Ideally monitor the first ~1 to make sure it is clipping a sensible number of integrations (no obvious outliers remaining, no huge gaps in the data caused by excessive clipping).
+
+5 – Run Stage 5 on **one** of those aperture+annulus combinations using default inputs (without a GP) and the orbital parameters provided in the Jira ticket; this will make sure you don't spend hours doing useless fits if there's a typo somewhere. To fit just a single aperture+annulus combination, simply set `allapers` to `False` and it'll just use the most recently run output which is fine for these quick testing purposes. Look at the output plots to make sure that there is an eclipse visible in the model line of the starting point figure — if there is not, there may be an issue with the specification of the orbital parameters. Once the fit is complete, there may no longer be an eclipse visible in the model line if the fitted eclipse depth is very small. Also make sure that the final fit from this single run provides a reasonable fit to the data, with no super-obvious residual trends in the data. If this fit didn't work well, then it's important to figure out why now before running a large number of other fits that will likely also fail. You're encouraged to consult with your color team members or the RWDDT JWST Data Analysis Team Lead for support if you cannot get a good fit to the data. Only proceed to the next step once you have a reasonable fit.
+
+6 – Run Stage 5 on all of those aperture+annulus combinations using default inputs (without a GP) and the orbital parameters provided in the Jira ticket. It will likely take quite a while for all fits to complete.
+
+7 – Choose 1-3 aperture+annulus combinations that seem best (using your best judgement and the plots in Section 6). Use the code at the bottom of the notebook in Section 6 to give you some stats to go off of. We’ll use those aperture settings as we test other reduction steps.
+
+8 – Try those 1-3 aperture+annulus pairs with any different Stage 1–5 settings you want to explore. Consider copying into new notebooks to keep tests organized. Important tests to run include initial ramp integration clipping (controlled by Stage 5's `manual_clip` parameter) and the robustness of the fit to the inclusion of different systematics vectors (are all systematics parameters needed?).
+
+9 – Try those 1-3 aperture+annulus pairs with loose priors on the eclipse timing or non-circular orbital parameters, if applicable (i.e., eccentricity != 0).
+
+10 – Try those 1-3 aperture+annulus pairs with GP, to assess whether the results are robust to marginalizing over the impact of potential residual red noise.
+
 
 ## Context behind the Stage 1 ECF
 
-Some of the parameters that might be worth varying are as follows:
+The following Stage 1 parameters adjust which steps are taken in the initial data reduction. Changing some of these parameters may have no noticeable effect on the data. Some descriptions of the various parameters available to change are:
 
 * `maximum_cores`: If you're running this notebook on STScI functional computers and/or you want to limit the CPU usage of the stage, you can set this to an integer number of cores or one of `'none'` (for single-threaded operations), `'quarter'`, `'half'`, or `'all'`.
 * `skip_emicorr`: It could be worth changing this between `True`/`False`, but this likely won't have a very large impact. Some preliminary testing has suggested that setting it to `False` may give better results.
@@ -56,8 +77,8 @@ There are only a couple attributes of the Stage 5 which you may need to change:
 
 * `ncpu`: Similar with Stages 1 & 3, adjust the number of CPU threads if needed.
 * `allapers`: Boolean to determine whether Stage 5 is run on all the apertures considered in Stage 4. If False, will just use the most recent output in the input directory.
-* `manual_clip`: A list of lists specifying the start and end integration numbers for manual removal. E.g., to remove the first 20 data points specify `[[0,20]]`, and to also remove the last 20 data points specify `[[0,20],[-20,None]]`. If you want to clip the 10th integration, this would be index `9` since python uses zero-indexing. And the `manual_clip` start and end values are used to slice a numpy array, so they follow the same convention of inclusive start index and exclusive end index. In other words, to trim the 10th integrations, you would set manual_clip to `[[9,10]]`. The default in the template ECF will remove the first 50 integrations which will likely remove most of the worst of the initial exponential ramp, but you should tune this if needed.
-* `run_myfuncs`: Determines the astrophysical and systematics models used in the Stage 5 fitting. For standard numpy functions, this can be one or more (separated by commas) of the following: `[batman_tr, batman_ecl, catwoman_tr, fleck_tr, poet_tr, poet_ecl, sinusoid_pc, quasilambert_pc, expramp, hstramp, polynomial, step, xpos, ypos, xwidth, ywidth, lorentzian, damped_osc, GP]`. The `poet_tr` and `poet_ecl` models assume a symmetric transit shape and, thus, are best-suited for planets with small eccentricities (e < 0.2). POET has a fast implementation of the 4-parameter limb darkening model that is valid for small planets (Rp/Rs < 0.1). In general for MIRI photometry, you will want to use `['batman_ecl', 'polynomial', 'expramp', 'xpos', 'ypos', 'xwidth', 'ywidth', 'GP']` (with the possible exception of the GP model which may not always be needed).
+* `manual_clip`: A list of lists specifying the start and end integration numbers for manual removal. E.g., to remove the first 20 data points specify [[0,20]], and to also remove the last 20 data points specify [[0,20],[-20,None]]. If you want to clip the 10th integration, this would be index 9 since python uses zero-indexing. And the manual_clip start and end values are used to slice a numpy array, so they follow the same convention of inclusive start index and exclusive end index. In other words, to trim the 10th integrations, you would set manual_clip to [[9,10]]. The default in the template ECF will remove the first 50 integrations, but you should tune this if needed. Analyses of data with large ramps have found removing hundreds of integrations to be beneficial in reducing biases on the fitted eclipse depth. Test the removal of progressively more integrations until there is no residual ramp-shape in the residuals to the fit (and potentially the eclipse depth stops meaningfully changing, indicating reduced biases), and then fix to lowest number of removed integrations that provides a consistently robust eclipse depth.
+* `run_myfuncs`: Determines the astrophysical and systematics models used in the Stage 5 fitting. For standard numpy functions, this can be one or more (separated by commas) of the following: `[batman_tr, batman_ecl, catwoman_tr, fleck_tr, poet_tr, poet_ecl, sinusoid_pc, quasilambert_pc, expramp, hstramp, polynomial, step, xpos, ypos, xwidth, ywidth, lorentzian, damped_osc, GP]`. In general for MIRI photometry, you will want to use ['batman_ecl', 'polynomial', 'expramp', 'xpos', 'ypos', 'xwidth', 'ywidth'], though the centroid positions (xpos,ypos) and xwidth terms are not always useful and can be turned off if not beneficial. When you’ve completed an initial reduction, try the use of a GP to detrend the systematics by adding ‘GP’ to the list.
 * If you are using the GP model, you can just leave the `GP inputs` section of the S5 ECF as-is (the Matérn-3/2 kernel from `celerite` generally works just fine).
 * The dynesty fitting parameters are setup such that you should get decent and robust results. If you want your corner plots to look more filled in, you can set `run_nlive` to some integer that is larger than `ndim * (ndim + 1) // 2` (where `ndim` is the number of fitted parameters), but in gneral that shouldn't be necessary.
 
