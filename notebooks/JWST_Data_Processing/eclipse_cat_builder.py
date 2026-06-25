@@ -555,7 +555,13 @@ def concat_eclipse_visits(datasets):
     return combined
 
 
-def save_multi_eclipse_hdf5(datasets, checkpoint, out_dir='.', hlspver=None):
+def save_multi_eclipse_hdf5(
+    datasets,
+    checkpoint,
+    out_dir='.',
+    hlspver=None,
+    filtername=None,
+):
     """
     Save multiple visits as a single HDF5 file named with ``checkpoint##``.
 
@@ -572,6 +578,9 @@ def save_multi_eclipse_hdf5(datasets, checkpoint, out_dir='.', hlspver=None):
     hlspver : str or None, optional
         HLSP version to embed in the filename. If ``None``, the function
         uses the ``HLSPVER`` attribute from the first dataset.
+    filtername : str or None, optional
+        Filter name to embed in the filename. If ``None``, the function
+        uses the shared ``filter`` value from the input datasets.
 
     Returns
     -------
@@ -590,10 +599,10 @@ def save_multi_eclipse_hdf5(datasets, checkpoint, out_dir='.', hlspver=None):
     -----
     The output filename pattern is:
 
-    ``hlsp_rocky-worlds_jwst_{instrume}_{planet}-checkpoint##_v{ver}_``
-    ``eclipse-cat.h5``
+    ``hlsp_rocky-worlds_jwst_{instrume}_{planet}-checkpoint##_{filter}_``
+    ``v{ver}_eclipse-cat.h5``
 
-    The filter and per-visit light-curve paths are not part of the name.
+    Per-visit light-curve paths are not part of the name.
     """
     if not datasets:
         raise ValueError("No datasets provided.")
@@ -619,12 +628,21 @@ def save_multi_eclipse_hdf5(datasets, checkpoint, out_dir='.', hlspver=None):
     # Concat visits
     combined = concat_eclipse_visits(datasets)
 
+    if filtername is None:
+        filters = {
+            str(np.asarray(ds['filter'].values).item())
+            for ds in datasets
+        }
+        if len(filters) != 1:
+            raise ValueError("Inconsistent filter across inputs.")
+        filtername = filters.pop()
+
     # Build filename with checkpoint## (two digits)
     planet_fn = ''.join(planet.lower().split())
     ckpt = f"checkpoint{int(checkpoint):02d}"
     out_name = (
         f"hlsp_rocky-worlds_jwst_{instrume.lower()}_{planet_fn}-"
-        f"{ckpt}_v{ver.lower()}_eclipse-cat.h5"
+        f"{ckpt}_{filtername.lower()}_v{ver.lower()}_eclipse-cat.h5"
     )
     out_path = str(Path(out_dir) / out_name)
 
@@ -1691,7 +1709,8 @@ def save_lightcurve_multi_hdf5(
     datasets,
     checkpoint,
     out_dir='.',
-    hlspver=None
+    hlspver=None,
+    filtername=None,
 ):
     """
     Save checkpoint light curves as one grouped netCDF4/HDF5 file.
@@ -1708,6 +1727,9 @@ def save_lightcurve_multi_hdf5(
         Directory where the file is written. Defaults to current directory.
     hlspver : str or None, optional
         HLSP version for the filename. If None, uses the root attrs.
+    filtername : str or None, optional
+        Filter name to embed in the filename. Required when ``datasets`` is
+        already a DataTree; otherwise inferred from the input datasets.
 
     Returns
     -------
@@ -1723,6 +1745,14 @@ def save_lightcurve_multi_hdf5(
     if hasattr(xr, 'DataTree') and isinstance(datasets, xr.DataTree):
         tree = datasets
     else:
+        if filtername is None:
+            filters = {
+                str(np.asarray(ds['filter'].values).item())
+                for ds in datasets
+            }
+            if len(filters) != 1:
+                raise ValueError('Inconsistent filter across inputs.')
+            filtername = filters.pop()
         tree = build_lightcurve_datatree(datasets)
 
     attrs = tree.attrs
@@ -1731,12 +1761,16 @@ def save_lightcurve_multi_hdf5(
     ver = hlspver or attrs.get('HLSPVER', '')
     if not ver:
         raise ValueError('HLSP version missing; pass hlspver or set attrs.')
+    if not filtername:
+        raise ValueError(
+            'Filter name missing; pass filtername when saving a DataTree.'
+        )
 
     planet_fn = ''.join(planet.lower().split())
     ckpt = f'checkpoint{int(checkpoint):02d}'
     out_name = (
         f'hlsp_rocky-worlds_jwst_{instrume.lower()}_{planet_fn}-'
-        f'{ckpt}_v{ver.lower()}_lc.h5'
+        f'{ckpt}_{filtername.lower()}_v{ver.lower()}_lc.h5'
     )
     out_path = str(Path(out_dir) / out_name)
 
@@ -3056,6 +3090,7 @@ def build_checkpoint_products(
         checkpoint,
         out_dir=out_dir,
         hlspver=HLSPVER,
+        filtername=str(cat_combined['filter'].values[0]),
     )
     checkpoint_figures = None
     if make_checkpoint_plots:
