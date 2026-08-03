@@ -426,6 +426,7 @@ def save_single_eclipse_hdf5(ds, out_dir='.'):
     out_path : str
         Path to the written file on disk.
     """
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
     instrume = ds.attrs['INSTRUME']
     planet = ds.attrs['PLANET']
     visit = int(np.asarray(ds['visit'].values).item())
@@ -644,6 +645,7 @@ def save_multi_eclipse_hdf5(
         f"hlsp_rocky-worlds_jwst_{instrume.lower()}_{planet_fn}-"
         f"{ckpt}_{filtername.lower()}_v{ver.lower()}_eclipse-cat.h5"
     )
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
     out_path = str(Path(out_dir) / out_name)
 
     # Compression for floats
@@ -1588,6 +1590,7 @@ def save_lightcurve_hdf5(ds, out_dir='.'):
     out_path : str
         Path to the written file on disk.
     """
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
     instrume = ds.attrs['INSTRUME']
     planet = ds.attrs['PLANET']
     visit = int(np.asarray(ds['visit'].values).item())
@@ -1772,6 +1775,7 @@ def save_lightcurve_multi_hdf5(
         f'hlsp_rocky-worlds_jwst_{instrume.lower()}_{planet_fn}-'
         f'{ckpt}_{filtername.lower()}_v{ver.lower()}_lc.h5'
     )
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
     out_path = str(Path(out_dir) / out_name)
 
     tree.to_netcdf(
