@@ -3,6 +3,8 @@
 
 A collection of Eureka! Control Files (.ecf files) and a Eureka! Parameter File (.epf file) are copied into the cells of this notebook. These parameters are setup with generally reasonable and performant settings that should give a good first analysis of the data from which you can further optimize the reduction.
 
+By default (`run_optimizers = True`), this notebook uses Eureka!'s Stage 1 and Stage 3/4 optimizers (see "Context behind the Stage 1/3/4 Optimizer" below) to automatically recommend and apply good Stage 1/3/4 settings. This is the recommended way to run this notebook, since it requires far less manual guess-and-check than tuning these settings by hand; only set `run_optimizers` to `False` if you want full manual control over every setting.
+
 For the deep-dive processing, the Stage 1-5 Eureka! Parameter Files will need to be adjusted to produce an optimal and robust reduction.
 
 All told, running Stages 1--5 for a single aperture+annulus pair will take ~30 minutes. Likely you'll want to explore many aperture+annulus pairs (the notebook is setup to automatically do this) which can result in many-hour analysis runs.
@@ -13,41 +15,48 @@ Below are the steps that we recommend you follow, along with detailed descriptio
 
 The following is a recommended order to structure your analysis:
 
-1 – Choose one Stage 1 setup.
+1a – Optimize Stage 1 (default but optional). By default (`run_optimizers = True`), the Stage 1 optimizer in Section 1.2 automatically explores and then recommends values for `jump_rejection_threshold`, `skip_lastframe`, `skip_rscd`, `rscd_group_skip1`, and `rscd_group_skip`, rather than you having to guess-and-check these settings by hand (see "Context behind the Stage 1/3/4 Optimizer" below). Set `run_optimizers` to `False` above if you'd rather choose one Stage 1 setup manually.
 
-2 – Run Stage 2 on that setup.
+1b – Run optimized Stage 1. Section 1.3 runs Stage 1 for real using the settings recommended in step 1a (or the hardcoded defaults, if you set `run_optimizers` to `False`).
 
-3 – Run a suite of different Stage 3 settings, particularly different aperture and annulus combinations. The default photap, skyin, skywidth should provide a sufficient sweep. This can take a while.
+2 – Run Stage 2 on that Stage 1 output.
 
-4 – Run Stage 4 on those aperture+annulus combinations using default inputs. Ideally monitor the first ~1 to make sure it is clipping a sensible number of integrations (no obvious outliers remaining, no huge gaps in the data caused by excessive clipping).
+3a – Optimize Stages 3-4 (default but optional). By default, the Stage 3/4 optimizer in Section 3.3 runs immediately after Stage 2, before Stage 3 or Stage 4 have been run at all, to quickly identify a promising `photap`/`skyin`/`skywidth` combination (plus `bg_thresh`, `dqmask`, `sigma`, and `box_width`). Set `run_optimizers` to `False` above if you'd rather explore the full default grid yourself.
 
-5 – Run Stage 5 on **one** of those aperture+annulus combinations using default inputs (without a GP) and the orbital parameters provided in the Jira ticket; this will make sure you don't spend hours doing useless fits if there's a typo somewhere. To fit just a single aperture+annulus combination, simply set `allapers` to `False` and it'll just use the most recently run output which is fine for these quick testing purposes. Look at the output plots to make sure that there is an eclipse visible in the model line of the starting point figure — if there is not, there may be an issue with the specification of the orbital parameters. Once the fit is complete, there may no longer be an eclipse visible in the model line if the fitted eclipse depth is very small. Also make sure that the final fit from this single run provides a reasonable fit to the data, with no super-obvious residual trends in the data. If this fit didn't work well, then it's important to figure out why now before running a large number of other fits that will likely also fail. You're encouraged to consult with your color team members or the RWDDT JWST Data Analysis Team Lead for support if you cannot get a good fit to the data. Only proceed to the next step once you have a reasonable fit.
+3b – Run optimized Stage 3 on a range of apertures and annuli. Section 3.4 runs Stage 3 over a narrowed grid centered on the step 3a recommendation (or the full default `photap`/`skyin`/`skywidth` grid, if you set `run_optimizers` to `False`). This can take a while, especially with `run_optimizers` set to `False`.
 
-6 – Run Stage 5 on all of those aperture+annulus combinations using default inputs (without a GP) and the orbital parameters provided in the Jira ticket. It will likely take quite a while for all fits to complete.
+4 – Run optimized Stage 4 on that same range of apertures and annuli. Section 4.1 runs Stage 4 on those aperture+annulus combinations using the `sigma`/`box_width` recommended in step 3a (or the hardcoded defaults, if `run_optimizers` is `False`). Ideally monitor the first ~1 to make sure it is clipping a sensible number of integrations (no obvious outliers remaining, no huge gaps in the data caused by excessive clipping).
 
-7 – Choose 1-3 aperture+annulus combinations that seem best (using your best judgement and the plots in Section 6). Use the code at the bottom of the notebook in Section 6 to give you some stats to go off of. We’ll use those aperture settings as we test other reduction steps.
+5a – Run Stage 5 on one aperture+annulus and fine-tune your fitting setup until you get a good fit. Set `allapers` to `False` in the Stage 5 ECF so it just uses the most recently run output; this will make sure you don't spend hours doing useless fits if there's a typo somewhere. Look at the output plots to make sure that there is an eclipse visible in the model line of the starting point figure — if there is not, there may be an issue with the specification of the orbital parameters. Once the fit is complete, there may no longer be an eclipse visible in the model line if the fitted eclipse depth is very small which is okay. Also make sure that the final fit from this single run provides a reasonable fit to the data, with no super-obvious residual trends in the data. Important tests to run here include the clipping of the worst of the initial settling ramp (controlled by Stage 5's `manual_clip` parameter) and the robustness of the fit to the inclusion of different systematics vectors (are all systematics parameters needed?). If this fit didn't work well, then it's important to figure out why now before running a large number of other fits that will likely also fail. You're encouraged to consult with your color team members or the RWDDT JWST Data Analysis Team Lead for support if you cannot get a good fit to the data. Only proceed to the next step once you have a reasonable, well-understood fit.
 
-8 – Try those 1-3 aperture+annulus pairs with any different Stage 1–5 settings you want to explore. Consider copying into new notebooks to keep tests organized. Important tests to run include initial ramp integration clipping (controlled by Stage 5's `manual_clip` parameter) and the robustness of the fit to the inclusion of different systematics vectors (are all systematics parameters needed?).
+5b – Run Stage 5 on that same range of apertures and annuli using your fitting setup from step 5a. Set `allapers` back to `True` and run Stage 5 on all of the aperture+annulus combinations from steps 3b-4. By default, Stage 3 and Stage 4 will already have only computed the narrowed set of combinations recommended in step 3a, so this naturally only has that smaller set to fit; if you set `run_optimizers` to `False`, this step will instead take quite a while since it will fit every combination from steps 3b-4.
 
-9 – Try those 1-3 aperture+annulus pairs with loose priors on the eclipse timing or non-circular orbital parameters, if applicable (i.e., eccentricity != 0).
+6 – Run the Section 6 cells and decide on your final aperture+annulus setup, using your best judgement and the plots and stats they produce.
 
-10 – Try those 1-3 aperture+annulus pairs with GP, to assess whether the results are robust to marginalizing over the impact of potential residual red noise.
+7 – Try that final aperture+annulus setup with loose priors on the eclipse timing or non-circular orbital parameters, if applicable (i.e., eccentricity != 0).
+
+8 – Try that final aperture+annulus setup with `'GP'` added to `run_myfuncs` and by uncommenting the `A` and `m` lines in your Stage 5 EPF, to assess whether the results are robust to marginalizing over the impact of potential residual red noise.
 
 
 ## Context behind the Stage 1 ECF
+
+By default (`run_optimizers = True`), the parameters below are automatically tuned by the Stage 1 optimizer in Section 1.2 instead of needing to be set by hand (see "Context behind the Stage 1/3/4 Optimizer" below) - the following descriptions are most relevant if you set `run_optimizers` to `False`, want to sanity-check the optimizer's recommendation, or want to manually override one of these parameters.
 
 The following Stage 1 parameters adjust which steps are taken in the initial data reduction. Changing some of these parameters may have no noticeable effect on the data. Some descriptions of the various parameters available to change are:
 
 * `maximum_cores`: If you're running this notebook on STScI functional computers and/or you want to limit the CPU usage of the stage, you can set this to an integer number of cores or one of `'none'` (for single-threaded operations), `'quarter'`, `'half'`, or `'all'`.
 * `skip_emicorr`: It could be worth changing this between `True`/`False`, but this likely won't have a very large impact. Some preliminary testing has suggested that setting it to `False` may give better results.
-* `skip_firstframe` & `skip_lastframe`: These might be worth changing between `True`/`False`. In theory it'd be best to set both to `False` (which removes the first and last groups, respectively), but for integrations with small numbers of groups it might be worth setting one or both to `True`. It is hard to say for sure without just trying different combinations.
+* `skip_lastframe`: This might be worth changing between `True`/`False`. In theory it'd be best to set this to `False` (which removes the last group), but for integrations with small numbers of groups it might be worth setting it to `True`. It is hard to say for sure without just trying both.
 * `skip_jump` & `jump_rejection_threshold`: The current jump step correction algorithm tends to suffer from quite high rates of false positives, so increasing `jump_rejection_threshold` beyond the `jwst` pipeline default of `4.0` to values like `8.0` or `10.0` might be worth trying, or potentially even completely skipping the jump step by setting `skip_jump` to `True`.
-* `skip_rscd`: This step helps to remove RSCD-related effects at the start of up-the-ramp reads. For integrations with small numbers of groups, this step is automatically skipped. However, even for integrations with intermediate numbers of groups, it may be worth skipping this step (setting `skip_rscd` to `True`) as the observations may be more photon-noise limited than RSCD-noise limited. Double-check whether or not the RSCD step was already skipped by default though before changing `skip_rscd` to `True`.
+* `skip_rscd`: This step helps to remove RSCD-related effects at the start of up-the-ramp reads. For integrations with small numbers of groups, this step is automatically skipped. However, even for integrations with intermediate numbers of groups, it may be worth skipping this step (setting `skip_rscd` to `True`) as the observations may be more photon-noise limited than RSCD-noise limited. Double-check whether or not the RSCD step was already skipped by default though before changing `skip_rscd` to `True`. Setting `skip_rscd` to `True` also disables the `rscd_group_skip1`/`rscd_group_skip` group flagging described below, since that flagging is applied by the RSCD step itself.
+* `rscd_group_skip1` & `rscd_group_skip`: These control how many groups get flagged as `DO_NOT_USE` by the RSCD step in the first integration (`rscd_group_skip1`) and in all later integrations (`rscd_group_skip`). The deprecated `firstframe` step no longer exists for MIRI - its functionality has been folded into the RSCD step, which is why these two parameters live here instead. Leave both as `None` to use the default, or set them to non-negative integers (e.g. `1`) to flag that many groups.
 * `skip_dark_current` & `skip_refpix`: By default these two steps are run for MIRI TSO observations and are likely best left to run (set both skip parameters to `False`), but it's maybe possible that better results could be obtained by experimenting with setting the skip parameters to `True`.
 
 For more information on the options available in Stage 1, visit https://eurekadocs.readthedocs.io/en/latest/ecf.html#stage-1
 
 ## Context behind the Stage 3 ECF
+
+By default (`run_optimizers = True`), `photap` and `skyin` are automatically narrowed to a window around the Stage 3/4 optimizer's recommendation in Section 3.3, `skywidth` is held fixed at its recommended value (since annulus width is normally not very important), and `bg_thresh`/`dqmask` are set to their recommended values. The descriptions below are most relevant if you set `run_optimizers` to `False`, want to sanity-check the optimizer's recommendation, or want to manually override one of these parameters.
 
 Some of the parameters that might be worth varying are as follows:
 
@@ -65,9 +74,20 @@ For more information on the options available in Stage 3, visit https://eurekado
 
 ## Context behind the Stage 4 ECF
 
-If after running Stage 4 you notice there were too many or too few clipped outliers, then you can adjust the `sigma` and/or `box_width` parameters here. You can likely rely on what was found in the quick-look analysis notebook though.
+By default (`run_optimizers = True`), `sigma` and `box_width` are automatically set by the Stage 3/4 optimizer in Section 3.3 instead of the hardcoded values below. If after running Stage 4 you notice there were too many or too few clipped outliers, then you can adjust the `sigma` and/or `box_width` parameters here (or set `run_optimizers` to `False` and rely on what was found in the quick-look analysis notebook instead).
 
 You may also want/need to adjust `allapers`, which is a boolean to determine whether Stage 4 is run on all the apertures considered in Stage 3. If `False`, it will just use the most recent output in the input directory. For example, if you only want to run Stage 4 on a specific aperture+annulus pair from Stage 3, make sure to update your `inputdir` path to be more precise (i.e., add `ap#_bg#_#/` to the end of the path to specify which particular aperture + annulus pairing)
+
+## Context behind the Stage 1/3/4 Optimizer
+
+Eureka! includes an optimizer tool that performs a fast parametric sweep of a chosen set of Stage 1, 3, and 4 parameters, evaluating each sweep value using the lightcurve's MAD (no Stage 5 fitting is required, which makes it much faster than trying different settings by hand). **Using this optimizer is the default and recommended way to run this notebook**, since it typically produces a good reduction with far less manual guess-and-check than tuning Stage 1/3/4 settings by hand. It is controlled by the `run_optimizers` toggle defined alongside `eventlabel` and `topdir` (`True` by default). More details are available at https://eurekadocs.readthedocs.io/en/latest/ecf.html#stages-1-3-4-optimizer.
+
+This notebook uses the optimizer in two places. Both cells write out their `params_to_optimize_s1`/`s3`/`s4` list and every `sweep_<parameter>` range explicitly (rather than relying on the tool's built-in defaults), so the exact set of parameters and ranges being explored is easy to review and adjust directly in the notebook:
+
+* **Section 1.2** runs the Stage 1 optimizer to recommend `jump_rejection_threshold`, `skip_lastframe`, `skip_rscd`, `rscd_group_skip1`, and `rscd_group_skip` (only processing the first file segment, to keep this fast). These recommended values are automatically applied when Stage 1 is run for real in Section 1.3. MIRI's deprecated `firstframe` step no longer exists in this version of Eureka! - its functionality has been folded into the RSCD step, which now flags `rscd_group_skip1` groups as `DO_NOT_USE` in the first integration and `rscd_group_skip` groups in all later integrations.
+* **Section 3.3** runs the Stage 3/4 optimizer to recommend `photap`, `skyin`, `skywidth`, `bg_thresh`, and `dqmask` (Stage 3) and `sigma` and `box_width` (Stage 4). This runs immediately after Stage 2 - before Stage 3 or Stage 4 have been run at all - so all of these recommendations are applied automatically: Stage 3 (Section 3.4) narrows its `photap`/`skyin` grid to a small window centered on the recommendation, holds `skywidth` fixed at its recommended value (since annulus width is normally not very important), and uses the recommended `bg_thresh`/`dqmask`, and Stage 4 (Section 4.1) uses the recommended `sigma`/`box_width`. This is where the time savings come from, since Stage 3, Stage 4, and eventually Stage 5 only ever need to process the narrowed set of combinations instead of the full grid.
+
+Only set `run_optimizers` to `False` if you want full manual control over every Stage 1/3/4 setting (e.g., to reproduce a specific prior reduction, or if you suspect the optimizer's fitness metric is being misled by some peculiarity of your particular dataset). Note that neither optimizer is a black-box solution: it is a tool for parameter exploration, and its "best" recommendation should still be sanity-checked against the plots produced during the sweep (and against the Section 6 comparison plots, once Stage 5 has run) before you rely on it.
 
 ## Context behind the Stage 5 ECF
 
