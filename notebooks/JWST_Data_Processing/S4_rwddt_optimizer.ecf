@@ -36,6 +36,10 @@ maxiters        20      # The number of iterations of sigma clipping that should
 boundary        fill    # Use 'fill' to extend the boundary values by the median of all data points (recommended), 'wrap' to use a periodic boundary, or 'extend' to use the first/last data points
 fill_value      mask    # Either the string 'mask' to mask the outlier values (recommended), 'boxcar' to replace data with the mean from the box-car filter, or a constant float-type fill value.
 
+# Diagnostics
+hide_plots      True
+verbose         False
+
 # Project directory (placeholder - overwritten at runtime by initialize_meta)
 topdir          /tmp
 

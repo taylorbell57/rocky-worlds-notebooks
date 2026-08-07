@@ -27,6 +27,10 @@ pmap				1535
 skip_flat_field     False       #### VERY LOW PRIORITY: Skipping the flat field can reduce systematics from noisy flat field reference files, but can also introduce other systematics if there are significant pixel-to-pixel sensitivity variations.
 skip_photom         True        # Strongly recommended to skip (unless doing flux calibrated photometry) in order to get better uncertainties out of Stage 3.
 
+# Diagnostics
+hide_plots          True
+verbose             False
+
 # Project directory (placeholder - overwritten at runtime by initialize_meta)
 topdir              /tmp
 

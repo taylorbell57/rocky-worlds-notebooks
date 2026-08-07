@@ -71,10 +71,10 @@ skywidth        30          # Width of the sky annulus, in pixels
 # Diagnostics
 isplots_S3      3
 nplots          3
-hide_plots      False
+hide_plots      True
 save_output     True
 save_fluxdata   False
-verbose         True
+verbose         False
 
 # Project directory (placeholder - overwritten at runtime by initialize_meta)
 topdir          /tmp

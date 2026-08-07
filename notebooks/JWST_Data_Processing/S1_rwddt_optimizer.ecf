@@ -48,7 +48,7 @@ rscd_group_skip           None         #### Number of groups to flag as DO_NOT_U
 isplots_S1                3
 nplots                    5
 hide_plots                True
-verbose                   True
+verbose                   False
 
 # Project directory (placeholder - overwritten at runtime by initialize_meta)
 topdir                    /tmp
