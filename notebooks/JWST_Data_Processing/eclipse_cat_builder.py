@@ -8,6 +8,7 @@ grouped light-curve products with one native time axis per visit.
 """
 
 from pathlib import Path
+import warnings
 import numpy as np
 import xarray as xr
 from astropy.io import fits
@@ -157,6 +158,59 @@ def read_stage2_r_s_meta(stage2_fits_path):
     return r_keys, s_keys, crds_ver, crds_ctx, filt, subarray, date_obs
 
 
+def _stellar_flux_from_fluxcal(fluxcal):
+    """
+    Read the absolute stellar flux and its uncertainty from Stage 4cal.
+
+    Parameters
+    ----------
+    fluxcal : xarray.Dataset
+        Stage-4cal ``CalStellarSpec`` dataset.
+
+    Returns
+    -------
+    f_med : float
+        Stellar flux rounded to ``absoluteFluxDecimals``.
+    f_err : float
+        Stellar flux uncertainty including the Gordon+2025 calibration
+        systematic, rounded to ``absoluteFluxDecimals``.
+
+    Notes
+    -----
+    If the FluxCal notebook saved adopted ``stellar_flux`` and
+    ``stellar_flux_err`` values (with the systematic already included) into
+    the Stage-4cal file, those are used verbatim. This allows custom choices
+    such as using the out-of-transit baseline when Stage 4cal was centered
+    on a transit. Otherwise, the in-eclipse ``ecl_flux``/``ecl_ferr`` values
+    are used and the systematic is added here.
+    """
+    if 'stellar_flux' in fluxcal and 'stellar_flux_err' in fluxcal:
+        stellar_flux = float(
+            np.asarray(fluxcal['stellar_flux'].values, dtype=float).ravel()[0]
+        )
+        stellar_flux_err = float(
+            np.asarray(
+                fluxcal['stellar_flux_err'].values, dtype=float
+            ).ravel()[0]
+        )
+    else:
+        warnings.warn(
+            'Stage-4cal product has no saved stellar_flux/stellar_flux_err; '
+            'falling back to the in-eclipse ecl_flux/ecl_ferr values. Re-run '
+            'the FluxCal notebook\'s stellar-flux cell to save adopted '
+            'values.',
+            stacklevel=2,
+        )
+        stellar_flux = float(fluxcal.ecl_flux.data[0][0])
+        ferr = float(fluxcal.ecl_ferr.data[0][0])
+        sys_err = (0.0048 * stellar_flux) ** 2 + (0.0045 * stellar_flux) ** 2
+        stellar_flux_err = np.sqrt(ferr**2 + sys_err)
+
+    f_med = np.round(stellar_flux, absoluteFluxDecimals)
+    f_err = np.round(stellar_flux_err, absoluteFluxDecimals)
+    return f_med, f_err
+
+
 def build_single_eclipse(
     stage2_fits,
     stage3_specdata,
@@ -187,8 +241,9 @@ def build_single_eclipse(
     stage3_specdata : str
         Path to Stage 3 product providing per-segment file list and versions.
     stage4cal : str
-        Path to Stage 4 flux calibration product holding stellar flux and
-        error.
+        Path to Stage 4 flux calibration product. Uses the adopted
+        ``stellar_flux``/``stellar_flux_err`` saved by the FluxCal notebook
+        when present, otherwise the in-eclipse ``ecl_flux``/``ecl_ferr``.
     stage5_samples : str
         Path to Stage 5 posterior samples. The samples may contain direct
         ``fp`` and ``t_secondary`` variables (or their ``_plN`` equivalents
@@ -335,12 +390,7 @@ def build_single_eclipse(
     )
 
     # Science results: absolute flux (with systematic inflation)
-    stellar_flux = float(fluxcal.ecl_flux.data[0][0])
-    ferr = float(fluxcal.ecl_ferr.data[0][0])
-    sys_err = (0.0048 * stellar_flux) ** 2 + (0.0045 * stellar_flux) ** 2
-    stellar_flux_err = np.sqrt(ferr**2 + sys_err)
-    f_med = np.round(stellar_flux, absoluteFluxDecimals)
-    f_err = np.round(stellar_flux_err, absoluteFluxDecimals)
+    f_med, f_err = _stellar_flux_from_fluxcal(fluxcal)
 
     # Build Dataset (one row)
     ds = xr.Dataset()
@@ -2755,12 +2805,7 @@ def build_single_eclipse_from_arrays(
         eclipseTimeDecimals,
     )
 
-    stellar_flux = float(fluxcal.ecl_flux.data[0][0])
-    ferr = float(fluxcal.ecl_ferr.data[0][0])
-    sys_err = (0.0048 * stellar_flux) ** 2 + (0.0045 * stellar_flux) ** 2
-    stellar_flux_err = np.sqrt(ferr**2 + sys_err)
-    f_med = np.round(stellar_flux, absoluteFluxDecimals)
-    f_err = np.round(stellar_flux_err, absoluteFluxDecimals)
+    f_med, f_err = _stellar_flux_from_fluxcal(fluxcal)
 
     v = int(visit)
     ds = xr.Dataset()
