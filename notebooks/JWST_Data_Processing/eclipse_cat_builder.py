@@ -170,6 +170,7 @@ def build_single_eclipse(
     stage5_epf=None,
     stage5_ecf=None,
     eclipse_epoch=None,
+    pid=0,
 ):
     """
     Build a one-row (visit) Dataset with visit-varying fields as columns.
@@ -190,8 +191,9 @@ def build_single_eclipse(
         error.
     stage5_samples : str
         Path to Stage 5 posterior samples. The samples may contain direct
-        ``fp`` and ``t_secondary`` variables, or timing parameters that can
-        be combined with fixed values from ``stage5_epf``.
+        ``fp`` and ``t_secondary`` variables (or their ``_plN`` equivalents
+        when ``pid > 0``), or timing parameters that can be combined with
+        fixed values from ``stage5_epf``.
     visit : int
         Eclipse index you assign (1, 2, ...) used for the ``visit`` coord
         and in output filenames. This is distinct from JWST VISIT_ID(s).
@@ -213,6 +215,11 @@ def build_single_eclipse(
     eclipse_epoch : int or None, optional
         Explicit eclipse epoch for derived secondary-eclipse times. If
         ``None``, the epoch is inferred from the Stage-2 exposure midpoint.
+    pid : int, optional
+        Zero-based Eureka planet index of the planet this HLSP describes.
+        ``0`` (default) uses unsuffixed parameters (``fp``, ``t0``, ...);
+        ``1`` uses ``fp_pl1``, ``t0_pl1``, etc. For systems with several
+        eclipsing planets, run once per planet with a matching ``PLANET``.
 
     Returns
     -------
@@ -302,6 +309,7 @@ def build_single_eclipse(
         v,
         n_samples,
         channel=ch,
+        pid=pid,
     )
     depth_vals = np.asarray(fp_samples, dtype=float) * 1.0e6
     d_med, d_std, d_up, d_lo = _array_stats(
@@ -319,6 +327,7 @@ def build_single_eclipse(
         channel=ch,
         eclipse_epoch=eclipse_epoch,
         compute_ltt=compute_ltt,
+        pid=pid,
     )
     t_med, t_std, t_up, t_lo = _array_stats(
         t_vals,
@@ -2038,9 +2047,29 @@ def _visit_channel(visit, channel=None):
     return int(visit) - 1
 
 
-def _visit_candidates(name, visit, channel=None):
+def _planet_suffix(pid=0):
     """
-    Return Eureka parameter candidates for a visit/channel.
+    Return Eureka's planet suffix for a zero-based planet index.
+
+    Parameters
+    ----------
+    pid : int, optional
+        Zero-based Eureka planet index.
+
+    Returns
+    -------
+    str
+        ``''`` for planet 0 (implicit ``_pl0``), otherwise ``'_pl{pid}'``.
+    """
+    pid = int(pid or 0)
+    if pid < 0:
+        raise ValueError(f'pid must be >= 0, got {pid}')
+    return '' if pid == 0 else f'_pl{pid}'
+
+
+def _visit_candidates(name, visit, channel=None, pid=0):
+    """
+    Return Eureka parameter candidates for a visit/channel/planet.
 
     Parameters
     ----------
@@ -2050,16 +2079,21 @@ def _visit_candidates(name, visit, channel=None):
         One-based visit number.
     channel : int or None, optional
         Explicit zero-based channel override.
+    pid : int, optional
+        Zero-based Eureka planet index. Planet 0 uses unsuffixed names
+        (e.g., ``fp``); planet ``N > 0`` uses ``_plN`` (e.g., ``fp_pl1``).
 
     Returns
     -------
     candidates : list of str
-        Candidate names, respecting Eureka's implicit ``_ch0`` convention.
+        Candidate names, respecting Eureka's implicit ``_pl0`` and ``_ch0``
+        conventions and its ``{name}_pl{N}_ch{M}`` suffix ordering.
     """
+    root = f'{name}{_planet_suffix(pid)}'
     ch = _visit_channel(visit, channel=channel)
     if ch == 0:
-        return [name]
-    return [f'{name}_ch{ch}', name]
+        return [root]
+    return [f'{root}_ch{ch}', root]
 
 
 def _epf_record(epf_params, candidate):
@@ -2111,6 +2145,7 @@ def _resolve_visit_param(
     channel=None,
     required=True,
     default=None,
+    pid=0,
 ):
     """
     Resolve a shared or visit-specific parameter to samples.
@@ -2129,6 +2164,9 @@ def _resolve_visit_param(
         Number of posterior draws.
     channel : int or None, optional
         Explicit zero-based channel override.
+    pid : int, optional
+        Zero-based Eureka planet index (``0`` -> ``fp``, ``1`` ->
+        ``fp_pl1``, ...). Use ``0`` for stellar parameters such as ``Rs``.
     required : bool, optional
         If ``True``, raise an error when missing.
     default : float or None, optional
@@ -2141,7 +2179,7 @@ def _resolve_visit_param(
     source : str
         Description of where the parameter was found.
     """
-    candidates = _visit_candidates(name, visit, channel=channel)
+    candidates = _visit_candidates(name, visit, channel=channel, pid=pid)
 
     for candidate in candidates:
         if samples is not None and candidate in samples:
@@ -2167,7 +2205,26 @@ def _resolve_visit_param(
 
     if required:
         tried = ', '.join(candidates)
-        raise KeyError(f'Could not resolve parameter {name!r}; tried {tried}')
+        msg = f'Could not resolve parameter {name!r}; tried {tried}'
+        # Point users at other planets' parameters (e.g., fp_pl1) if present
+        available = set()
+        if samples is not None:
+            available.update(str(key) for key in samples.data_vars)
+        if epf_params:
+            available.update(str(key) for key in epf_params)
+        pattern = re.compile(
+            rf'^{re.escape(name)}_pl(\d+)(?:_|$)', re.IGNORECASE
+        )
+        other_pids = sorted(
+            {int(m.group(1)) for m in map(pattern.match, available) if m}
+            - {int(pid or 0)}
+        )
+        if other_pids:
+            msg += (
+                f'. Found parameters for planet index(es) {other_pids}; '
+                'set pid to select a different planet.'
+            )
+        raise KeyError(msg)
 
     return None, 'missing'
 
@@ -2433,6 +2490,7 @@ def _resolve_secondary_time_samples(
     channel=None,
     eclipse_epoch=None,
     compute_ltt=True,
+    pid=0,
 ):
     """
     Resolve or derive secondary-eclipse timing samples.
@@ -2455,6 +2513,10 @@ def _resolve_secondary_time_samples(
         Explicit epoch override. If ``None``, inferred from ``mjd_mid``.
     compute_ltt : bool, optional
         Whether to include light-travel time in derived timings.
+    pid : int, optional
+        Zero-based Eureka planet index. Orbital parameters are resolved
+        with the matching ``_plN`` suffix; the stellar radius ``Rs`` is
+        always resolved without a planet suffix.
 
     Returns
     -------
@@ -2471,15 +2533,18 @@ def _resolve_secondary_time_samples(
             n_samples,
             channel=channel,
             required=False,
+            pid=pid,
         )
         if values is not None:
             return _to_bjd_tdb(values)
 
     t0, _ = _resolve_visit_param(
-        samples, epf_params, 't0', visit, n_samples, channel=channel
+        samples, epf_params, 't0', visit, n_samples, channel=channel,
+        pid=pid,
     )
     per, _ = _resolve_visit_param(
-        samples, epf_params, 'per', visit, n_samples, channel=channel
+        samples, epf_params, 'per', visit, n_samples, channel=channel,
+        pid=pid,
     )
     ecosw, _ = _resolve_visit_param(
         samples,
@@ -2490,6 +2555,7 @@ def _resolve_secondary_time_samples(
         channel=channel,
         required=False,
         default=0.0,
+        pid=pid,
     )
     esinw, _ = _resolve_visit_param(
         samples,
@@ -2500,6 +2566,7 @@ def _resolve_secondary_time_samples(
         channel=channel,
         required=False,
         default=0.0,
+        pid=pid,
     )
     b, _ = _resolve_visit_param(
         samples,
@@ -2510,6 +2577,7 @@ def _resolve_secondary_time_samples(
         channel=channel,
         required=False,
         default=0.0,
+        pid=pid,
     )
     a, _ = _resolve_visit_param(
         samples,
@@ -2520,6 +2588,7 @@ def _resolve_secondary_time_samples(
         channel=channel,
         required=bool(compute_ltt),
         default=None if compute_ltt else 1.0,
+        pid=pid,
     )
     rs, _ = _resolve_visit_param(
         samples,
@@ -2778,12 +2847,15 @@ def _catalog_from_shared_fit(
     HLSPVER,
     channel=None,
     eclipse_epoch=None,
+    pid=0,
 ):
     """
     Build one catalog row from shared samples plus EPF/ECF context.
 
     Parameters are the same as :func:`build_single_eclipse_from_arrays`,
-    with additional shared-fit context.
+    with additional shared-fit context. ``pid`` is the zero-based Eureka
+    planet index used to select ``fp``/``fp_pl1``/... and the matching
+    orbital parameters.
 
     Returns
     -------
@@ -2802,6 +2874,7 @@ def _catalog_from_shared_fit(
         v,
         n_samples,
         channel=ch,
+        pid=pid,
     )
 
     mjd_mid = _stage2_mjd_mid(stage2_fits)
@@ -2814,6 +2887,7 @@ def _catalog_from_shared_fit(
         channel=ch,
         eclipse_epoch=eclipse_epoch,
         compute_ltt=compute_ltt,
+        pid=pid,
     )
     return build_single_eclipse_from_arrays(
         stage2_fits,
@@ -2881,6 +2955,7 @@ def build_single_eclipse_products(
     channel=None,
     eclipse_epoch=None,
     make_fits=True,
+    pid=0,
 ):
     """
     Build and save all single-eclipse HLSP products.
@@ -2909,6 +2984,9 @@ def build_single_eclipse_products(
         Explicit integer eclipse epoch override.
     make_fits : bool, optional
         Whether to also write the FITS catalog product.
+    pid : int, optional
+        Zero-based Eureka planet index of the planet described by ``PLANET``
+        (``0`` -> ``fp``, ``1`` -> ``fp_pl1``, ...).
 
     Returns
     -------
@@ -2935,6 +3013,7 @@ def build_single_eclipse_products(
         HLSPVER,
         channel=channel,
         eclipse_epoch=eclipse_epoch,
+        pid=pid,
     )
 
     cat_h5 = save_single_eclipse_hdf5(cat_ds, out_dir)
@@ -2976,6 +3055,7 @@ def build_checkpoint_products(
     make_fits=True,
     make_checkpoint_plots=False,
     obs_ids=None,
+    pid=0,
 ):
     """
     Build and save all checkpoint HLSP products from a shared fit.
@@ -3009,6 +3089,11 @@ def build_checkpoint_products(
         labels. A flat sequence is interpreted as one ID per detected
         observation chunk; a nested sequence is interpreted as one sequence
         of IDs per plotted row.
+    pid : int, optional
+        Zero-based Eureka planet index of the planet described by ``PLANET``.
+        ``0`` (default) uses unsuffixed parameters (``fp``, ``t0``, ...);
+        ``1`` uses ``fp_pl1``, ``t0_pl1``, etc. For systems with several
+        eclipsing planets, call once per planet with a matching ``PLANET``.
 
     Returns
     -------
@@ -3064,6 +3149,7 @@ def build_checkpoint_products(
             HLSPVER,
             channel=channel,
             eclipse_epoch=eclipse_epoch,
+            pid=pid,
         )
         cat_datasets.append(cat_ds)
 
@@ -3109,6 +3195,7 @@ def build_checkpoint_products(
             planet=PLANET,
             out_dir=out_dir,
             obs_ids=obs_ids,
+            pid=pid,
         )
 
     return {
@@ -3204,6 +3291,7 @@ def _checkpoint_timing_samples(
     fit_time,
     visit=1,
     channel=None,
+    pid=0,
 ):
     """
     Resolve transit, period, and secondary-eclipse samples for plotting.
@@ -3225,6 +3313,8 @@ def _checkpoint_timing_samples(
         Visit/channel to use for shared timing parameters.
     channel : int or None, optional
         Explicit zero-based channel override.
+    pid : int, optional
+        Zero-based Eureka planet index whose orbit should be used.
 
     Returns
     -------
@@ -3241,6 +3331,7 @@ def _checkpoint_timing_samples(
         visit,
         n_samples,
         channel=channel,
+        pid=pid,
     )
     per, _ = _resolve_visit_param(
         samples,
@@ -3249,6 +3340,7 @@ def _checkpoint_timing_samples(
         visit,
         n_samples,
         channel=channel,
+        pid=pid,
     )
     t_secondary = _resolve_secondary_time_samples(
         samples,
@@ -3258,6 +3350,7 @@ def _checkpoint_timing_samples(
         channel=channel,
         eclipse_epoch=0,
         compute_ltt=compute_ltt,
+        pid=pid,
     )
     return {
         't0': _match_time_scale(t0, fit_time),
@@ -3972,6 +4065,7 @@ def make_checkpoint_phase_folded_figure(
     zoom_ylim=None,
     zoom_ylim_residuals=None,
     unbinned_alpha=0.1,
+    pid=0,
 ):
     """
     Make the four-panel phase-folded checkpoint summary figure.
@@ -4006,6 +4100,8 @@ def make_checkpoint_phase_folded_figure(
         binned-flux panel's max-min span, centered on zero.
     unbinned_alpha : float, optional
         Alpha for unbinned points.
+    pid : int, optional
+        Zero-based Eureka planet index whose orbit is used for folding.
 
     Returns
     -------
@@ -4026,6 +4122,7 @@ def make_checkpoint_phase_folded_figure(
         comp['time'],
         visit=visit,
         channel=channel,
+        pid=pid,
     )
 
     t0 = float(np.nanmedian(timing['t0']))
@@ -4234,6 +4331,7 @@ def make_checkpoint_observation_summary_figure(
     clean_ylim=None,
     date_obs=None,
     obs_ids=None,
+    pid=0,
 ):
     """
     Make the per-observation checkpoint report summary figure.
@@ -4272,6 +4370,8 @@ def make_checkpoint_observation_summary_figure(
         Explicit observation IDs for row labels. A flat sequence is
         interpreted as one ID per detected observation chunk. A nested
         sequence is interpreted as one sequence of IDs per plotted row.
+    pid : int, optional
+        Zero-based Eureka planet index whose orbit sets the eclipse times.
 
     Returns
     -------
@@ -4292,6 +4392,7 @@ def make_checkpoint_observation_summary_figure(
         comp['time'],
         visit=visit,
         channel=channel,
+        pid=pid,
     )
 
     time = comp['time']
@@ -4476,6 +4577,7 @@ def make_checkpoint_figures(
     prefix=None,
     date_obs=None,
     obs_ids=None,
+    pid=0,
 ):
     """
     Make and save the standard checkpoint report figures.
@@ -4504,6 +4606,8 @@ def make_checkpoint_figures(
         Explicit observation IDs for observation-summary row labels. A flat
         sequence is interpreted as one ID per detected observation chunk; a
         nested sequence is interpreted as one sequence of IDs per plotted row.
+    pid : int, optional
+        Zero-based Eureka planet index whose orbit is used for the figures.
 
     Returns
     -------
@@ -4533,6 +4637,7 @@ def make_checkpoint_figures(
         stage5_ecf=stage5_ecf,
         out_path=phase_png,
         pdf_path=phase_pdf,
+        pid=pid,
     )
     obs_fig = make_checkpoint_observation_summary_figure(
         stage5_fit,
@@ -4543,6 +4648,7 @@ def make_checkpoint_figures(
         pdf_path=obs_pdf,
         date_obs=date_obs,
         obs_ids=obs_ids,
+        pid=pid,
     )
     return {
         'phase_folded': phase_png,
