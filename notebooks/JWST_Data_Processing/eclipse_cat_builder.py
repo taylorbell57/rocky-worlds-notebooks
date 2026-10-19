@@ -1359,6 +1359,11 @@ def build_lightcurve_dataset(
     PLANET,
     SRC_DOI,
     HLSPVER,
+    stage5_samples=None,
+    stage5_epf=None,
+    stage5_ecf=None,
+    pid=0,
+    channel=None,
 ):
     """
     Build a single-visit light-curve Dataset (multi-visit ready).
@@ -1392,6 +1397,19 @@ def build_lightcurve_dataset(
         DOI for the source data specific to this visit.
     HLSPVER : str
         HLSP version string to store in the dataset attributes.
+    stage5_samples : str, xarray.Dataset, or None, optional
+        Stage-5 posterior samples. If provided, an ``eclipseModel`` variable
+        holding only planet ``pid``'s eclipse (see
+        :func:`_eclipse_only_model`) is added. If ``None``, it is omitted.
+    stage5_epf, stage5_ecf : str, dict, or None, optional
+        Eureka parameter/control files (paths or already-parsed
+        dictionaries) used with ``stage5_samples``.
+    pid : int, optional
+        Zero-based Eureka planet index for ``eclipseModel``.
+    channel : int or None, optional
+        Zero-based Eureka channel for ``eclipseModel``. By default,
+        ``visit - 1`` (the shared-fit convention, which falls back to
+        unsuffixed parameters when channel-specific ones are absent).
 
     Returns
     -------
@@ -1550,6 +1568,44 @@ def build_lightcurve_dataset(
     )
     cleaned.name = 'cleanedFlux'
 
+    series = {
+        'rawFlux': raw_flux,
+        'rawFluxErr': raw_flux_err,
+        'astroModel': astro,
+    }
+    if stage5_samples is not None:
+        if isinstance(stage5_epf, dict):
+            epf_params = stage5_epf
+        else:
+            epf_params = parse_epf(stage5_epf)
+        if isinstance(stage5_ecf, dict):
+            ecf_config = stage5_ecf
+        else:
+            ecf_config = parse_ecf(stage5_ecf)
+        ch = _visit_channel(v, channel=channel)
+        ecl_vals = _eclipse_only_model(
+            fit['time'].values,
+            _load_samples_dataset(stage5_samples),
+            epf_params,
+            ecf_config,
+            visit=ch + 1,
+            channel=ch,
+            pid=pid,
+        )
+        eclipse = _series1(
+            _to_full(ecl_vals),
+            full_time, v, units=lightcurve_units, decimals=lightcurveDecimals,
+        )
+        eclipse.name = 'eclipseModel'
+        eclipse.attrs['pid'] = int(pid)
+        eclipse.attrs['description'] = (
+            'Secondary-eclipse model of this planet only (excludes transits, '
+            'stellar variability, and other planets), rebuilt with batman '
+            'from posterior medians. Eclipse-only cleaned flux is '
+            'cleanedFlux - astroModel + eclipseModel.'
+        )
+        series['eclipseModel'] = eclipse
+
     # Centroid diagnostics from Stage-4 (on the full time axis)
     x = lc['centroid_x'].values + np.nanmin(spec_ds.x.values)
     y = lc['centroid_y'].values + np.nanmin(spec_ds.y.values)
@@ -1564,9 +1620,7 @@ def build_lightcurve_dataset(
     # Assemble dataset
     ds = xr.Dataset(
         {
-            'rawFlux': raw_flux,
-            'rawFluxErr': raw_flux_err,
-            'astroModel': astro,
+            **series,
             'noiseModel': noise,
             'fullModel': full,
             'cleanedFlux': cleaned,
@@ -1908,9 +1962,11 @@ def parse_epf(epf_path):
     Returns
     -------
     params : dict
-        Mapping from normalized parameter name to a record with keys
-        ``name``, ``value``, ``free``, ``prior_par1``, ``prior_par2``, and
-        ``prior_type`` where available.
+        Mapping from the exact (case-sensitive) parameter name to a record
+        with keys ``name``, ``value``, ``free``, ``prior_par1``,
+        ``prior_par2``, and ``prior_type`` where available. Names are kept
+        case-sensitive like in Eureka, where e.g. ``a`` (semi-major axis)
+        and ``A`` (ramp amplitude) are different parameters.
     """
     import shlex
 
@@ -1941,7 +1997,7 @@ def parse_epf(epf_path):
                 if len(parts) > 4 else None,
                 'prior_type': parts[5].strip('"\'') if len(parts) > 5 else '',
             }
-            params[_normalize_control_key(name)] = record
+            params[str(name).strip()] = record
     return params
 
 
@@ -2155,7 +2211,7 @@ def _epf_record(epf_params, candidate):
     epf_params : dict
         Parsed EPF parameter dictionary.
     candidate : str
-        Candidate parameter name.
+        Candidate parameter name (case-sensitive, as in Eureka).
 
     Returns
     -------
@@ -2164,7 +2220,7 @@ def _epf_record(epf_params, candidate):
     """
     if not epf_params:
         return None
-    return epf_params.get(_normalize_control_key(candidate))
+    return epf_params.get(str(candidate).strip())
 
 
 def _broadcast(value, n_samples):
@@ -2262,9 +2318,7 @@ def _resolve_visit_param(
             available.update(str(key) for key in samples.data_vars)
         if epf_params:
             available.update(str(key) for key in epf_params)
-        pattern = re.compile(
-            rf'^{re.escape(name)}_pl(\d+)(?:_|$)', re.IGNORECASE
-        )
+        pattern = re.compile(rf'^{re.escape(name)}_pl(\d+)(?:_|$)')
         other_pids = sorted(
             {int(m.group(1)) for m in map(pattern.match, available) if m}
             - {int(pid or 0)}
@@ -2298,77 +2352,6 @@ def _to_bjd_tdb(values):
     if med < 1000000.0:
         return arr + timeOffset
     return arr
-
-
-def _conjunction_derivative(f, ecc, omega, sin_i2):
-    """
-    Derivative of projected separation squared with true anomaly.
-
-    Parameters
-    ----------
-    f : numpy.ndarray
-        True anomaly in radians.
-    ecc : numpy.ndarray
-        Eccentricity.
-    omega : numpy.ndarray
-        Argument of periastron in radians.
-    sin_i2 : numpy.ndarray
-        ``sin(inclination)**2``.
-
-    Returns
-    -------
-    numpy.ndarray
-        Derivative of ``log(projected_separation**2)``.
-    """
-    u = omega + f
-    denom = 1.0 + ecc * np.cos(f)
-    q = 1.0 - sin_i2 * np.sin(u) ** 2
-    denom = np.maximum(denom, 1.0e-14)
-    q = np.maximum(q, 1.0e-14)
-    return 2.0 * ecc * np.sin(f) / denom - sin_i2 * np.sin(2.0 * u) / q
-
-
-def _find_conjunction_true_anomaly(ecc, omega, sin_i2, primary=True):
-    """
-    Find the true anomaly of the projected-separation minimum.
-
-    Parameters
-    ----------
-    ecc : numpy.ndarray
-        Eccentricity.
-    omega : numpy.ndarray
-        Argument of periastron in radians.
-    sin_i2 : numpy.ndarray
-        ``sin(inclination)**2``.
-    primary : bool, optional
-        If ``True``, solve near primary transit; otherwise near eclipse.
-
-    Returns
-    -------
-    numpy.ndarray
-        True anomaly in radians.
-    """
-    if primary:
-        f = 0.5 * np.pi - omega
-    else:
-        f = 1.5 * np.pi - omega
-    f = np.mod(f, 2.0 * np.pi)
-
-    eps = 1.0e-5
-    for _ in range(20):
-        val = _conjunction_derivative(f, ecc, omega, sin_i2)
-        hi = _conjunction_derivative(f + eps, ecc, omega, sin_i2)
-        lo = _conjunction_derivative(f - eps, ecc, omega, sin_i2)
-        der = (hi - lo) / (2.0 * eps)
-        step = np.divide(
-            val,
-            der,
-            out=np.zeros_like(val, dtype=float),
-            where=np.abs(der) > 1.0e-14,
-        )
-        step = np.clip(step, -0.25, 0.25)
-        f = np.mod(f - step, 2.0 * np.pi)
-    return f
 
 
 def _mean_anomaly_from_true(f, ecc):
@@ -2421,13 +2404,17 @@ def _secondary_delta_days(
     per,
     ecosw,
     esinw,
-    b,
+    inc,
     a,
     rs,
     compute_ltt=True,
 ):
     """
     Compute eclipse timing offset from the preceding transit.
+
+    Transit and eclipse are placed at true anomalies ``pi/2 - omega`` and
+    ``3*pi/2 - omega``, matching the conventions of batman and Eureka's
+    ``get_ecl_midpt``, so derived times agree with how ``t0`` was fitted.
 
     Parameters
     ----------
@@ -2437,12 +2424,13 @@ def _secondary_delta_days(
         ``ecc * cos(omega)``.
     esinw : array-like
         ``ecc * sin(omega)``.
-    b : array-like
-        Transit impact parameter.
+    inc : array-like
+        Orbital inclination in degrees. Only used for the light-travel time.
     a : array-like
-        Scaled semi-major axis, ``a/Rs``.
+        Scaled semi-major axis, ``a/Rs``. Only used for the light-travel
+        time.
     rs : array-like
-        Stellar radius in Solar radii.
+        Stellar radius in Solar radii. Only used for the light-travel time.
     compute_ltt : bool, optional
         Whether to include the light-travel-time correction.
 
@@ -2454,22 +2442,13 @@ def _secondary_delta_days(
     per = np.asarray(per, dtype=float)
     ecosw = np.asarray(ecosw, dtype=float)
     esinw = np.asarray(esinw, dtype=float)
-    b = np.asarray(b, dtype=float)
-    a = np.asarray(a, dtype=float)
-    rs = np.asarray(rs, dtype=float)
 
     ecc = np.sqrt(ecosw**2 + esinw**2)
     ecc = np.clip(ecc, 0.0, 1.0 - 1.0e-10)
     omega = np.arctan2(esinw, ecosw)
 
-    # Infer inclination from the transit impact parameter relation.
-    cos_i = b / a * (1.0 + esinw) / np.maximum(1.0 - ecc**2, 1.0e-14)
-    cos_i = np.clip(cos_i, 0.0, 1.0)
-    sin_i = np.sqrt(np.maximum(1.0 - cos_i**2, 0.0))
-    sin_i2 = sin_i**2
-
-    f_tr = _find_conjunction_true_anomaly(ecc, omega, sin_i2, primary=True)
-    f_sec = _find_conjunction_true_anomaly(ecc, omega, sin_i2, primary=False)
+    f_tr = 0.5 * np.pi - omega
+    f_sec = 1.5 * np.pi - omega
 
     m_tr = _mean_anomaly_from_true(f_tr, ecc)
     m_sec = _mean_anomaly_from_true(f_sec, ecc)
@@ -2477,6 +2456,9 @@ def _secondary_delta_days(
     delta_days = per * delta_m / (2.0 * np.pi)
 
     if compute_ltt:
+        a = np.asarray(a, dtype=float)
+        rs = np.asarray(rs, dtype=float)
+        sin_i = np.sin(np.deg2rad(np.asarray(inc, dtype=float)))
         r_tr = a * (1.0 - ecc**2) / (1.0 + ecc * np.cos(f_tr))
         r_sec = a * (1.0 - ecc**2) / (1.0 + ecc * np.cos(f_sec))
         z_tr = -r_tr * sin_i * np.sin(omega + f_tr)
@@ -2529,6 +2511,110 @@ def _infer_eclipse_epoch(mjd_mid, t0, per, delta_days):
     per_ref = float(np.nanmedian(per))
     delta_ref = float(np.nanmedian(delta_days))
     return int(np.round((float(mjd_mid) - t0_ref - delta_ref) / per_ref))
+
+
+def _resolve_orbit_samples(
+    samples,
+    epf_params,
+    visit,
+    n_samples,
+    channel=None,
+    pid=0,
+):
+    """
+    Resolve one planet's orbital parameters using Eureka's conventions.
+
+    Every parameterization Eureka accepts is supported: ``a`` or ``ars``;
+    ``ecosw``/``esinw`` or ``ecc``/``w`` (``w`` in degrees); and ``inc``
+    (degrees) or ``b``, with ``inc = arccos(b / a)`` as in Eureka.
+
+    Parameters
+    ----------
+    samples : xarray.Dataset
+        Stage-5 posterior samples.
+    epf_params : dict
+        Parsed EPF parameters.
+    visit : int
+        One-based visit number.
+    n_samples : int
+        Number of posterior samples.
+    channel : int or None, optional
+        Explicit zero-based channel override.
+    pid : int, optional
+        Zero-based Eureka planet index. ``Rs`` is always resolved without a
+        planet suffix.
+
+    Returns
+    -------
+    orbit : dict
+        Sample arrays for ``t0``, ``per``, ``ecosw``, ``esinw``, ``ecc``,
+        ``w`` (degrees), ``a``, ``inc`` (degrees), and ``Rs``. ``t0``,
+        ``a``, ``inc``, and ``Rs`` are ``None`` when they cannot be
+        resolved.
+    """
+    def _get(name, required=False, planet=pid):
+        values, _ = _resolve_visit_param(
+            samples,
+            epf_params,
+            name,
+            visit,
+            n_samples,
+            channel=channel,
+            required=required,
+            pid=planet,
+        )
+        return values
+
+    t0 = _get('t0')
+    per = _get('per', required=True)
+
+    a = _get('a')
+    if a is None:
+        a = _get('ars')
+
+    ecosw = _get('ecosw')
+    esinw = _get('esinw')
+    if ecosw is None and esinw is None:
+        ecc = _get('ecc')
+        w = _get('w')
+        if ecc is None or np.all(ecc == 0.0):
+            ecosw = esinw = np.zeros(int(n_samples))
+        elif w is None:
+            raise KeyError(
+                'Found a non-zero eccentricity (ecc) but no argument of '
+                f'periastron (w) for planet index {pid}.'
+            )
+        else:
+            ecosw = ecc * np.cos(np.deg2rad(w))
+            esinw = ecc * np.sin(np.deg2rad(w))
+    else:
+        zeros = np.zeros(int(n_samples))
+        ecosw = zeros if ecosw is None else ecosw
+        esinw = zeros if esinw is None else esinw
+    ecc = np.sqrt(ecosw**2 + esinw**2)
+    w = np.rad2deg(np.arctan2(esinw, ecosw))
+
+    inc = _get('inc')
+    if inc is None:
+        b = _get('b')
+        if b is None:
+            inc = np.full(int(n_samples), 90.0)
+        elif a is not None:
+            inc = np.rad2deg(np.arccos(np.clip(b / a, -1.0, 1.0)))
+
+    rs = _get('Rs', planet=0)
+
+    return {
+        't0': t0,
+        'per': per,
+        'ecosw': ecosw,
+        'esinw': esinw,
+        'ecc': ecc,
+        'w': w,
+        'a': a,
+        'inc': inc,
+        'Rs': rs,
+    }
 
 
 def _resolve_secondary_time_samples(
@@ -2588,76 +2674,38 @@ def _resolve_secondary_time_samples(
         if values is not None:
             return _to_bjd_tdb(values)
 
-    t0, _ = _resolve_visit_param(
-        samples, epf_params, 't0', visit, n_samples, channel=channel,
-        pid=pid,
-    )
-    per, _ = _resolve_visit_param(
-        samples, epf_params, 'per', visit, n_samples, channel=channel,
-        pid=pid,
-    )
-    ecosw, _ = _resolve_visit_param(
+    orbit = _resolve_orbit_samples(
         samples,
         epf_params,
-        'ecosw',
         visit,
         n_samples,
         channel=channel,
-        required=False,
-        default=0.0,
         pid=pid,
     )
-    esinw, _ = _resolve_visit_param(
-        samples,
-        epf_params,
-        'esinw',
-        visit,
-        n_samples,
-        channel=channel,
-        required=False,
-        default=0.0,
-        pid=pid,
-    )
-    b, _ = _resolve_visit_param(
-        samples,
-        epf_params,
-        'b',
-        visit,
-        n_samples,
-        channel=channel,
-        required=False,
-        default=0.0,
-        pid=pid,
-    )
-    a, _ = _resolve_visit_param(
-        samples,
-        epf_params,
-        'a',
-        visit,
-        n_samples,
-        channel=channel,
-        required=bool(compute_ltt),
-        default=None if compute_ltt else 1.0,
-        pid=pid,
-    )
-    rs, _ = _resolve_visit_param(
-        samples,
-        epf_params,
-        'Rs',
-        visit,
-        n_samples,
-        channel=channel,
-        required=bool(compute_ltt),
-        default=None if compute_ltt else 1.0,
-    )
+    t0 = orbit['t0']
+    per = orbit['per']
+    if t0 is None:
+        # Re-resolve as required to raise the standard error message
+        _resolve_visit_param(
+            samples, epf_params, 't0', visit, n_samples, channel=channel,
+            pid=pid,
+        )
+    if compute_ltt:
+        missing = [k for k in ('a', 'inc', 'Rs') if orbit[k] is None]
+        if missing:
+            raise KeyError(
+                f'Could not resolve {missing} needed for the light-travel-'
+                'time correction (a/ars, inc or b, and Rs). Add them to the '
+                'EPF or set compute_ltt to False in the ECF.'
+            )
 
     delta_days = _secondary_delta_days(
         per,
-        ecosw,
-        esinw,
-        b,
-        a,
-        rs,
+        orbit['ecosw'],
+        orbit['esinw'],
+        orbit['inc'],
+        orbit['a'],
+        orbit['Rs'],
         compute_ltt=compute_ltt,
     )
 
@@ -2671,6 +2719,153 @@ def _resolve_secondary_time_samples(
 
     t_secondary_mjd = t0 + epoch * per + delta_days
     return _to_bjd_tdb(t_secondary_mjd)
+
+
+def _eclipse_only_model(
+    time,
+    samples,
+    epf_params,
+    ecf_config=None,
+    visit=1,
+    channel=None,
+    pid=0,
+):
+    """
+    Evaluate one planet's secondary-eclipse model, excluding other signals.
+
+    Eureka's ``astrophysical model`` adds the star (including any transits
+    and stellar variability) to the eclipse flux of every planet. This
+    rebuilds only planet ``pid``'s batman eclipse from posterior medians
+    (or EPF fixed values), normalized like ``astroModel``: ``1 + fp`` out of
+    eclipse and ``1`` in eclipse.
+
+    Parameters
+    ----------
+    time : array-like
+        Times at which to evaluate the model, in the Stage-5 fit-table time
+        convention (BMJD_TDB) or full BJD_TDB.
+    samples : xarray.Dataset
+        Stage-5 posterior samples.
+    epf_params : dict
+        Parsed EPF parameters.
+    ecf_config : dict or None, optional
+        Parsed ECF values (``compute_ltt``; defaults to ``True``).
+    visit : int, optional
+        One-based visit number.
+    channel : int or None, optional
+        Explicit zero-based channel override.
+    pid : int, optional
+        Zero-based Eureka planet index.
+
+    Returns
+    -------
+    numpy.ndarray
+        Eclipse-only model evaluated at ``time``.
+
+    Notes
+    -----
+    As in Eureka, the light-travel-time delay is applied when
+    ``compute_ltt`` is enabled. Here it is applied as a constant shift of the
+    eclipse center, which is accurate to well below a second over an
+    eclipse.
+    """
+    import batman
+
+    time = np.asarray(time, dtype=float)
+    n_samples = _infer_n_samples(samples)
+    compute_ltt = get_compute_ltt(ecf_config, default=True)
+
+    def _get(name, required=False):
+        values, _ = _resolve_visit_param(
+            samples,
+            epf_params,
+            name,
+            visit,
+            n_samples,
+            channel=channel,
+            required=required,
+            pid=pid,
+        )
+        return values
+
+    fp = _get('fp', required=True)
+    rp = _get('rp')
+    if rp is None:
+        rp = _get('rprs')
+    orbit = _resolve_orbit_samples(
+        samples,
+        epf_params,
+        visit,
+        n_samples,
+        channel=channel,
+        pid=pid,
+    )
+    missing = [
+        name for name, value in
+        (('rp/rprs', rp), ('a/ars', orbit['a']), ('inc/b', orbit['inc']))
+        if value is None
+    ]
+    if missing:
+        raise KeyError(
+            f'Could not resolve {missing} for planet index {pid}; these are '
+            'needed to build the eclipse-only model.'
+        )
+
+    t_geo = None
+    for name in ['t_secondary', 'tsec', 't_eclipse', 'teclipse']:
+        t_geo = _get(name)
+        if t_geo is not None:
+            break
+    delta_geo = _secondary_delta_days(
+        orbit['per'],
+        orbit['ecosw'],
+        orbit['esinw'],
+        orbit['inc'],
+        orbit['a'],
+        orbit['Rs'],
+        compute_ltt=False,
+    )
+    if t_geo is None:
+        if orbit['t0'] is None:
+            raise KeyError(
+                f'Could not resolve t_secondary or t0 for planet index {pid}.'
+            )
+        t_geo = orbit['t0'] + delta_geo
+    t_sec = float(np.nanmedian(_match_time_scale(t_geo, time)))
+
+    ecosw = float(np.nanmedian(orbit['ecosw']))
+    esinw = float(np.nanmedian(orbit['esinw']))
+    per = float(np.nanmedian(orbit['per']))
+    a = float(np.nanmedian(orbit['a']))
+    inc = float(np.nanmedian(orbit['inc']))
+    # Like Eureka, only apply the light-travel time when t0 and Rs are known
+    if (compute_ltt and orbit['Rs'] is not None
+            and orbit['t0'] is not None):
+        args = (per, ecosw, esinw, inc, a, float(np.nanmedian(orbit['Rs'])))
+        t_sec += float(
+            _secondary_delta_days(*args, compute_ltt=True)
+            - _secondary_delta_days(*args, compute_ltt=False)
+        )
+
+    params = batman.TransitParams()
+    params.t0 = t_sec - float(np.nanmedian(delta_geo))
+    params.t_secondary = t_sec
+    params.per = per
+    params.rp = float(np.nanmedian(rp))
+    params.a = a
+    params.inc = inc
+    params.ecc = float(np.hypot(ecosw, esinw))
+    params.w = float(np.rad2deg(np.arctan2(esinw, ecosw)))
+    params.fp = float(np.nanmedian(fp))
+    params.limb_dark = 'uniform'
+    params.u = []
+
+    model = batman.TransitModel(
+        params,
+        np.ascontiguousarray(time),
+        transittype='secondary',
+    )
+    return np.asarray(model.light_curve(params), dtype=float)
 
 
 def _array_stats(values, decimals):
@@ -3074,6 +3269,11 @@ def build_single_eclipse_products(
         PLANET,
         SRC_DOI,
         HLSPVER,
+        stage5_samples=samples,
+        stage5_epf=epf_params,
+        stage5_ecf=ecf_config,
+        pid=pid,
+        channel=channel,
     )
     lc_h5 = save_lightcurve_hdf5(lc_ds, out_dir)
 
@@ -3153,6 +3353,7 @@ def build_checkpoint_products(
 
     cat_datasets = []
     lc_datasets = []
+    fit_channels = []
 
     for info in visits:
         visit = int(_visit_value(info, 'visit'))
@@ -3208,8 +3409,14 @@ def build_checkpoint_products(
             PLANET,
             src_doi,
             HLSPVER,
+            stage5_samples=samples,
+            stage5_epf=epf_params,
+            stage5_ecf=ecf_config,
+            pid=pid,
+            channel=channel,
         )
         lc_datasets.append(lc_ds)
+        fit_channels.append(_visit_channel(visit, channel=channel))
 
     cat_combined, cat_h5 = save_multi_eclipse_hdf5(
         cat_datasets,
@@ -3241,6 +3448,7 @@ def build_checkpoint_products(
             out_dir=out_dir,
             obs_ids=obs_ids,
             pid=pid,
+            channels=sorted(set(fit_channels)),
         )
 
     return {
@@ -3484,6 +3692,115 @@ def _fit_components(fit_table):
         'model_col': model_col,
         'astro_col': astro_col,
     }
+
+
+def _fit_table_channel_blocks(time, gap_days=0.5):
+    """
+    Split a shared Stage-5 fit table into per-channel row blocks.
+
+    Eureka writes shared/multi-white fit tables channel by channel, with
+    time increasing within each channel. A new block therefore starts
+    wherever time jumps backwards or by more than ``gap_days``.
+
+    Parameters
+    ----------
+    time : array-like
+        Fit-table time column, in row order.
+    gap_days : float, optional
+        Forward gap that starts a new block.
+
+    Returns
+    -------
+    list of numpy.ndarray
+        Row indices for each block, in table order.
+    """
+    time = np.asarray(time, dtype=float)
+    if time.size == 0:
+        return []
+    jumps = np.diff(time)
+    cuts = np.where((jumps < 0.0) | (jumps > float(gap_days)))[0] + 1
+    starts = np.r_[0, cuts]
+    stops = np.r_[cuts, time.size]
+    return [np.arange(start, stop) for start, stop in zip(starts, stops)]
+
+
+def _eclipse_only_components(
+    comp,
+    samples,
+    epf_params,
+    ecf_config,
+    pid=0,
+    channels=None,
+    gap_days=0.5,
+):
+    """
+    Replace fit-table astrophysical components with eclipse-only versions.
+
+    Parameters
+    ----------
+    comp : dict
+        Output of :func:`_fit_components`.
+    samples : xarray.Dataset
+        Stage-5 posterior samples.
+    epf_params : dict
+        Parsed EPF parameters.
+    ecf_config : dict
+        Parsed ECF values.
+    pid : int, optional
+        Zero-based Eureka planet index.
+    channels : sequence of int or None, optional
+        Eureka channel for each row block found by
+        :func:`_fit_table_channel_blocks`. By default, block ``i`` is
+        channel ``i``.
+    gap_days : float, optional
+        Gap used to find row blocks.
+
+    Returns
+    -------
+    dict
+        Copy of ``comp`` where ``astro_model`` is planet ``pid``'s eclipse
+        only and ``clean_flux`` has other astrophysical signals removed. If
+        the eclipse model cannot be built, ``comp`` is returned unchanged
+        with a warning.
+    """
+    time = comp['time']
+    blocks = _fit_table_channel_blocks(time, gap_days=gap_days)
+    if channels is not None and len(channels) != len(blocks):
+        warnings.warn(
+            f'Found {len(blocks)} row blocks in the Stage-5 fit table but '
+            f'{len(channels)} channels were given; assuming block i is '
+            'channel i.',
+            stacklevel=3,
+        )
+        channels = None
+    if channels is None:
+        channels = range(len(blocks))
+
+    eclipse = np.full_like(time, np.nan, dtype=float)
+    try:
+        for idx, ch in zip(blocks, channels):
+            ch = int(ch)
+            eclipse[idx] = _eclipse_only_model(
+                time[idx],
+                samples,
+                epf_params,
+                ecf_config,
+                visit=ch + 1,
+                channel=ch,
+                pid=pid,
+            )
+    except KeyError as err:
+        warnings.warn(
+            f'Could not build the eclipse-only model ({err}); plotting the '
+            'full astrophysical model instead.',
+            stacklevel=3,
+        )
+        return comp
+
+    out = dict(comp)
+    out['clean_flux'] = comp['clean_flux'] - comp['astro_model'] + eclipse
+    out['astro_model'] = eclipse
+    return out
 
 
 def _weighted_bins_by_count(x, y, yerr, target_bins=28):
@@ -4111,6 +4428,7 @@ def make_checkpoint_phase_folded_figure(
     zoom_ylim_residuals=None,
     unbinned_alpha=0.1,
     pid=0,
+    channels=None,
 ):
     """
     Make the four-panel phase-folded checkpoint summary figure.
@@ -4146,7 +4464,12 @@ def make_checkpoint_phase_folded_figure(
     unbinned_alpha : float, optional
         Alpha for unbinned points.
     pid : int, optional
-        Zero-based Eureka planet index whose orbit is used for folding.
+        Zero-based Eureka planet index whose orbit is used for folding. The
+        calibrated-flux panels show only this planet's eclipse model, with
+        other astrophysical signals removed from the data.
+    channels : sequence of int or None, optional
+        Eureka channel for each per-channel block of rows in the shared
+        fit table (in table order). By default, block ``i`` is channel ``i``.
 
     Returns
     -------
@@ -4168,6 +4491,14 @@ def make_checkpoint_phase_folded_figure(
         visit=visit,
         channel=channel,
         pid=pid,
+    )
+    comp = _eclipse_only_components(
+        comp,
+        samples,
+        epf_params,
+        ecf_config,
+        pid=pid,
+        channels=channels,
     )
 
     t0 = float(np.nanmedian(timing['t0']))
@@ -4377,6 +4708,7 @@ def make_checkpoint_observation_summary_figure(
     date_obs=None,
     obs_ids=None,
     pid=0,
+    channels=None,
 ):
     """
     Make the per-observation checkpoint report summary figure.
@@ -4417,6 +4749,11 @@ def make_checkpoint_observation_summary_figure(
         sequence is interpreted as one sequence of IDs per plotted row.
     pid : int, optional
         Zero-based Eureka planet index whose orbit sets the eclipse times.
+        The calibrated-flux panels show only this planet's eclipse model,
+        with other astrophysical signals removed from the data.
+    channels : sequence of int or None, optional
+        Eureka channel for each per-channel block of rows in the shared
+        fit table (in table order). By default, block ``i`` is channel ``i``.
 
     Returns
     -------
@@ -4438,6 +4775,15 @@ def make_checkpoint_observation_summary_figure(
         visit=visit,
         channel=channel,
         pid=pid,
+    )
+    comp = _eclipse_only_components(
+        comp,
+        samples,
+        epf_params,
+        ecf_config,
+        pid=pid,
+        channels=channels,
+        gap_days=visit_gap_days,
     )
 
     time = comp['time']
@@ -4623,6 +4969,7 @@ def make_checkpoint_figures(
     date_obs=None,
     obs_ids=None,
     pid=0,
+    channels=None,
 ):
     """
     Make and save the standard checkpoint report figures.
@@ -4652,7 +4999,11 @@ def make_checkpoint_figures(
         sequence is interpreted as one ID per detected observation chunk; a
         nested sequence is interpreted as one sequence of IDs per plotted row.
     pid : int, optional
-        Zero-based Eureka planet index whose orbit is used for the figures.
+        Zero-based Eureka planet index whose orbit and eclipse are used for
+        the figures.
+    channels : sequence of int or None, optional
+        Eureka channel for each per-channel block of rows in the shared
+        fit table (in table order). By default, block ``i`` is channel ``i``.
 
     Returns
     -------
@@ -4683,6 +5034,7 @@ def make_checkpoint_figures(
         out_path=phase_png,
         pdf_path=phase_pdf,
         pid=pid,
+        channels=channels,
     )
     obs_fig = make_checkpoint_observation_summary_figure(
         stage5_fit,
@@ -4694,6 +5046,7 @@ def make_checkpoint_figures(
         date_obs=date_obs,
         obs_ids=obs_ids,
         pid=pid,
+        channels=channels,
     )
     return {
         'phase_folded': phase_png,
@@ -4705,9 +5058,15 @@ def make_checkpoint_figures(
     }
 
 
-def make_lightcurve_fit_figure(ds, planet, out_path=None):
+def make_lightcurve_fit_figure(ds, planet, out_path=None, clip_sigma=20):
     """
     Make the fitted-light-curve summary figure for one visit.
+
+    If ``ds`` contains ``eclipseModel``, the middle panel shows only that
+    planet's eclipse, with cleaned flux ``cleanedFlux - astroModel +
+    eclipseModel`` so that other astrophysical signals (e.g., another
+    planet's transit) are removed. Otherwise ``astroModel`` and
+    ``cleanedFlux`` are shown.
 
     Parameters
     ----------
@@ -4717,6 +5076,9 @@ def make_lightcurve_fit_figure(ds, planet, out_path=None):
         Planet name for the title.
     out_path : str or None, optional
         If provided, save the figure to this path.
+    clip_sigma : float, optional
+        Sigma threshold for masking raw-flux outliers in the top panel
+        (iterated until no more points are clipped).
 
     Returns
     -------
@@ -4737,10 +5099,16 @@ def make_lightcurve_fit_figure(ds, planet, out_path=None):
     time = ds.time - t_offset
     raw = ds.rawFlux[0]
     err = ds.rawFluxErr[0]
+    if 'eclipseModel' in ds:
+        model_b = ds.eclipseModel[0]
+        clean_b = ds.cleanedFlux[0] - ds.astroModel[0] + model_b
+    else:
+        model_b = ds.astroModel[0]
+        clean_b = ds.cleanedFlux[0]
 
     axs['A'].errorbar(
         time,
-        sigma_clip(raw, sigma=20, maxiters=None),
+        sigma_clip(raw, sigma=clip_sigma, maxiters=None),
         err,
         fmt='.',
         c='k',
@@ -4758,7 +5126,7 @@ def make_lightcurve_fit_figure(ds, planet, out_path=None):
 
     axs['B'].errorbar(
         time,
-        ds.cleanedFlux[0],
+        clean_b,
         err,
         fmt='.',
         c='k',
@@ -4766,7 +5134,7 @@ def make_lightcurve_fit_figure(ds, planet, out_path=None):
     )
     axs['B'].plot(
         time,
-        ds.astroModel[0],
+        model_b,
         '-',
         c='r',
         lw=1,
@@ -4798,7 +5166,7 @@ def make_lightcurve_fit_figure(ds, planet, out_path=None):
     return fig
 
 
-def make_raw_measurements_figure(ds, planet, out_path=None):
+def make_raw_measurements_figure(ds, planet, out_path=None, clip_sigma=20):
     """
     Make the raw-measurements diagnostic figure for one visit.
 
@@ -4810,6 +5178,9 @@ def make_raw_measurements_figure(ds, planet, out_path=None):
         Planet name for the title.
     out_path : str or None, optional
         If provided, save the figure to this path.
+    clip_sigma : float, optional
+        Sigma threshold for masking outliers in each panel (iterated until
+        no more points are clipped).
 
     Returns
     -------
@@ -4839,8 +5210,11 @@ def make_raw_measurements_figure(ds, planet, out_path=None):
             ~np.isfinite(var[0]) + ~np.isfinite(ds.rawFlux[0]),
             var[0],
         )
-        data = sigma_clip(data, sigma=20, maxiters=None)
+        data = sigma_clip(data, sigma=clip_sigma, maxiters=None)
         axs[axname].plot(ds.time - t_offset, data, '.', c='k', ms=1)
+
+    for ax in axs.values():
+        ax.ticklabel_format(axis='y', style='plain', useOffset=False)
 
     axs['A'].set_title(f'{planet} Raw Measurements')
     axs['A'].set_ylabel('Flux')
@@ -4856,7 +5230,7 @@ def make_raw_measurements_figure(ds, planet, out_path=None):
     return fig
 
 
-def make_lightcurve_figures(ds, planet, out_dir='.', prefix=''):
+def make_lightcurve_figures(ds, planet, out_dir='.', prefix='', clip_sigma=20):
     """
     Make and save both standard light-curve figures for one visit.
 
@@ -4870,6 +5244,8 @@ def make_lightcurve_figures(ds, planet, out_dir='.', prefix=''):
         Output directory.
     prefix : str, optional
         Filename prefix, e.g. ``'ecl001_'``.
+    clip_sigma : float, optional
+        Sigma threshold for outlier masking in both figures.
 
     Returns
     -------
@@ -4879,8 +5255,12 @@ def make_lightcurve_figures(ds, planet, out_dir='.', prefix=''):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     raw_path = str(Path(out_dir) / f'{prefix}Figure1.png')
     fit_path = str(Path(out_dir) / f'{prefix}Figure2.png')
-    fig_raw = make_raw_measurements_figure(ds, planet, raw_path)
-    fig_fit = make_lightcurve_fit_figure(ds, planet, fit_path)
+    fig_raw = make_raw_measurements_figure(
+        ds, planet, raw_path, clip_sigma=clip_sigma
+    )
+    fig_fit = make_lightcurve_fit_figure(
+        ds, planet, fit_path, clip_sigma=clip_sigma
+    )
     return {
         'raw_measurements': raw_path,
         'fit_summary': fit_path,
