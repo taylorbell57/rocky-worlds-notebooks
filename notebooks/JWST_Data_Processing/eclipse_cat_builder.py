@@ -52,7 +52,7 @@ def _da1(value, visit_idx, units=None):
     ----------
     value : Any
         Value to place in the single-element array.
-    visit_idx : int
+    visit_idx : int or str
         Visit index to use as the coordinate value.
     units : str or None, optional
         Units to attach to the DataArray (stored in ``attrs['units']``).
@@ -530,7 +530,7 @@ def _ensure_var(ds, name, vtype, visit_idx):
         Variable name to ensure.
     vtype : {'float', 'str', 'datetime'}
         Desired variable type.
-    visit_idx : int
+    visit_idx : int or str
         Visit index for the single row.
 
     Returns
@@ -572,6 +572,9 @@ def concat_eclipse_visits(datasets):
     - Datetime fields use NaT.
     - All provenance text (``R_*``, ``S_*``, and ``CRDS_*``) are strings.
     - Text/provenance fields are filled with empty strings.
+    - Catalogs containing ``joint`` use string visit labels, with numeric
+      visits sorted numerically and ``joint`` last. Integer-only catalogs
+      retain integer coordinates.
     """
     if not datasets:
         raise ValueError('No datasets provided for concatenation.')
@@ -599,9 +602,14 @@ def concat_eclipse_visits(datasets):
 
     # Normalize variable sets across inputs before concatenating.
     norm = []
+    has_joint = any(
+        str(np.asarray(ds['visit'].values).item()) == 'joint'
+        for ds in datasets
+    )
     for ds in datasets:
-        # Get Python int visit index from coordinate.
-        v = int(np.asarray(ds['visit'].values).item())
+        v = np.asarray(ds['visit'].values).item()
+        v = str(v) if has_joint else int(v)
+        ds = ds.assign_coords(visit=[v])
         for name in sorted(all_vars):
             ds = _ensure_var(ds, name, _kind(name), v)
         norm.append(ds)
@@ -609,7 +617,13 @@ def concat_eclipse_visits(datasets):
     combined = xr.concat(norm, dim='visit', join='outer')
 
     # Sort rows by visit index.
-    order = np.argsort(combined['visit'].values)
+    order = sorted(
+        range(combined.sizes['visit']),
+        key=lambda i: (
+            (1, 0) if str(combined['visit'].values[i]) == 'joint'
+            else (0, int(combined['visit'].values[i]))
+        ),
+    )
     combined = combined.isel(visit=order)
     combined.attrs.update(datasets[0].attrs)
     return combined
@@ -936,6 +950,7 @@ def _build_measurements_hdu(ds):
                            format=f'A{width}')
 
     cols += [
+        scol('visit', 'VISIT'),
         scol('VISIT_ID', 'VISIT_ID'),
         scol('filter', 'FILTER'),
         scol('subarray', 'SUBARRAY'),
@@ -1070,7 +1085,8 @@ def hdf5_checkpoint_to_fits(h5_path):
     hdus = [phdu]
     # One header-only OBS### per visit
     for i in range(n):
-        hdus.append(_obs_hdu_for_visit(ds, i))
+        if str(ds['visit'].values[i]) != 'joint':
+            hdus.append(_obs_hdu_for_visit(ds, i))
     # Measurements table with all visits
     hdus.append(_build_measurements_hdu(ds))
     out_path = str(Path(h5_path).with_suffix('.fits'))
@@ -2896,6 +2912,56 @@ def _array_stats(values, decimals):
     return med, std, up, lo
 
 
+def _checkpoint_depth_samples(samples, channel=0, pid=0):
+    """Read an exact depth posterior without shared-parameter fallback."""
+    name = f'fp{_planet_suffix(pid)}'
+    if channel:
+        name += f'_ch{int(channel)}'
+    if name not in samples:
+        raise KeyError(
+            f'Missing checkpoint depth posterior {name!r}; provide shared '
+            'depth samples for joint and channel-specific depth samples '
+            'from the visit-dependent-depth simultaneous fit for visits.'
+        )
+    values = np.asarray(samples[name].values, dtype=float).ravel()
+    if not values.size or not np.all(np.isfinite(values)):
+        raise ValueError(f'Depth posterior {name!r} must be nonempty and finite.')
+    return values
+
+
+def _set_catalog_depth(ds, fp_samples):
+    """Assign the four catalog depth statistics to a single-row dataset."""
+    stats = _array_stats(
+        np.asarray(fp_samples, dtype=float) * 1.0e6,
+        eclipseDepthDecimals,
+    )
+    visit = np.asarray(ds['visit'].values).item()
+    for suffix, value in zip(
+        ('', 'Error', 'UpperError', 'LowerError'), stats
+    ):
+        ds[f'eclipseDepth{suffix}'] = _da1(
+            value, visit, units=eclipseDepth_units
+        )
+    return ds
+
+
+def _joint_catalog_row(template, fp_samples):
+    """Create a depth-only joint row without borrowing visit measurements."""
+    ds = xr.Dataset(coords={'visit': ['joint']}, attrs=dict(template.attrs))
+    for name in template.data_vars:
+        if name == 'filter':
+            value = template[name].values.item()
+        elif np.issubdtype(template[name].dtype, np.datetime64):
+            value = np.datetime64('NaT', 'ns')
+        elif np.issubdtype(template[name].dtype, np.number):
+            value = np.nan
+        else:
+            value = ''
+        ds[name] = _da1(value, 'joint')
+        ds[name].attrs = dict(template[name].attrs)
+    return _set_catalog_depth(ds, fp_samples)
+
+
 def build_single_eclipse_from_arrays(
     stage2_fits,
     stage3_specdata,
@@ -2990,11 +3056,6 @@ def build_single_eclipse_from_arrays(
         crds_ctx_hdr or getattr(dm.meta.ref_file.crds, 'context_used', '')
     )
 
-    depth_vals = np.asarray(fp_samples, dtype=float) * 1.0e6
-    d_med, d_std, d_up, d_lo = _array_stats(
-        depth_vals,
-        eclipseDepthDecimals,
-    )
     t_med, t_std, t_up, t_lo = _array_stats(
         t_secondary_samples_bjd,
         eclipseTimeDecimals,
@@ -3003,12 +3064,7 @@ def build_single_eclipse_from_arrays(
     f_med, f_err = _stellar_flux_from_fluxcal(fluxcal)
 
     v = int(visit)
-    ds = xr.Dataset()
-
-    ds['eclipseDepth'] = _da1(d_med, v, units=eclipseDepth_units)
-    ds['eclipseDepthError'] = _da1(d_std, v, units=eclipseDepth_units)
-    ds['eclipseDepthUpperError'] = _da1(d_up, v, units=eclipseDepth_units)
-    ds['eclipseDepthLowerError'] = _da1(d_lo, v, units=eclipseDepth_units)
+    ds = _set_catalog_depth(xr.Dataset(coords={'visit': [v]}), fp_samples)
 
     ds['eclipseTime'] = _da1(t_med, v, units=time_units)
     ds['eclipseTimeError'] = _da1(t_std, v, units=time_units)
@@ -3301,9 +3357,11 @@ def build_checkpoint_products(
     make_checkpoint_plots=False,
     obs_ids=None,
     pid=0,
+    *,
+    stage5_visit_samples,
 ):
     """
-    Build and save all checkpoint HLSP products from a shared fit.
+    Build checkpoint products from shared- and visit-dependent-depth fits.
 
     Parameters
     ----------
@@ -3313,7 +3371,14 @@ def build_checkpoint_products(
         ``stage4cal``, and ``SRC_DOI``/``src_doi``. Optional keys are
         ``channel`` and ``eclipse_epoch``.
     stage5_samples : str
-        Shared Stage-5 posterior samples file.
+        Shared-depth Stage-5 posterior samples file. Supplies the joint
+        depth, all eclipse times, and all light-curve models and figures.
+    stage5_visit_samples : str or xarray.Dataset
+        Required posterior samples from a second simultaneous fit with
+        visit-dependent depths and shared orbital parameters. Used only
+        for numbered catalog rows' depths, with exact planet/channel keys
+        required (no fallback to shared depths or EPF values). No second
+        fit table, EPF, or ECF is needed.
     stage5_fit : str
         Shared Stage-5 fit table containing all eclipses.
     stage5_epf, stage5_ecf : str or None
@@ -3343,11 +3408,17 @@ def build_checkpoint_products(
     Returns
     -------
     outputs : dict
-        Paths and in-memory datasets for the generated products.
+        Paths and in-memory datasets for the generated products. Catalog
+        visit labels are strings with ``joint`` last. The joint row stores
+        only depth statistics and shared context, not a fictional eclipse
+        time, stellar flux, or observation provenance. Light curves retain
+        integer visit indices and contain real observations only.
     """
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     samples = _load_samples_dataset(stage5_samples)
+    visit_samples = _load_samples_dataset(stage5_visit_samples)
+    joint_fp = _checkpoint_depth_samples(samples, pid=pid)
     epf_params = parse_epf(stage5_epf)
     ecf_config = parse_ecf(stage5_ecf)
 
@@ -3357,6 +3428,10 @@ def build_checkpoint_products(
 
     for info in visits:
         visit = int(_visit_value(info, 'visit'))
+        if visit < 1 or any(
+            int(ds['visit'].values.item()) == visit for ds in cat_datasets
+        ):
+            raise ValueError('Checkpoint visits must be unique positive integers.')
         stage2_fits = _visit_value(info, 'stage2_fits')
         stage3_specdata = _visit_value(info, 'stage3_specdata')
         stage4_lcdata = _visit_value(info, 'stage4_lcdata')
@@ -3381,6 +3456,9 @@ def build_checkpoint_products(
             required=False,
         )
 
+        fp = _checkpoint_depth_samples(
+            visit_samples, channel=_visit_channel(visit, channel), pid=pid
+        )
         cat_ds = _catalog_from_shared_fit(
             stage2_fits,
             stage3_specdata,
@@ -3397,7 +3475,8 @@ def build_checkpoint_products(
             eclipse_epoch=eclipse_epoch,
             pid=pid,
         )
-        cat_datasets.append(cat_ds)
+        cat_ds = _set_catalog_depth(cat_ds, fp)
+        cat_datasets.append(cat_ds.assign_coords(visit=[str(visit)]))
 
         lc_ds = build_lightcurve_dataset(
             stage2_fits,
@@ -3418,6 +3497,9 @@ def build_checkpoint_products(
         lc_datasets.append(lc_ds)
         fit_channels.append(_visit_channel(visit, channel=channel))
 
+    if not cat_datasets:
+        raise ValueError('No visits provided for checkpoint products.')
+    cat_datasets.append(_joint_catalog_row(cat_datasets[0], joint_fp))
     cat_combined, cat_h5 = save_multi_eclipse_hdf5(
         cat_datasets,
         checkpoint,
@@ -3441,7 +3523,7 @@ def build_checkpoint_products(
             stage5_samples,
             stage5_epf=stage5_epf,
             stage5_ecf=stage5_ecf,
-            date_obs=cat_combined['date_obs'].values
+            date_obs=cat_combined['date_obs'].isel(visit=slice(0, -1)).values
             if 'date_obs' in cat_combined else None,
             checkpoint=checkpoint,
             planet=PLANET,
