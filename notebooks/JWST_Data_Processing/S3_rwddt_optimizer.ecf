@@ -35,7 +35,7 @@ suffix          calints
 
 calibrated_spectra  False   # Set True to generate flux-calibrated spectra/photometry in mJy
                             # Set False to convert to electrons
-pmap            1535
+pmap            1584
 
 # Subarray region of interest
 ywindow         None	    # Vertical axis as seen in DS9

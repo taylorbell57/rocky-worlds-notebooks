@@ -23,7 +23,7 @@
 # Stage 1 Documentation: https://eurekadocs.readthedocs.io/en/latest/ecf.html#stage-1
 
 suffix                    uncal
-pmap                      1535         # Setting a fixed pmap value to ensure consistency in reductions
+pmap                      1584         # Setting a fixed pmap value to ensure consistency in reductions
 
 maximum_cores             'half'       # Options are 'none', 'quarter', 'half', 'all', or any integer
 
